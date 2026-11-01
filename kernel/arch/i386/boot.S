@@ -28,7 +28,8 @@ _start:
 
 	# Call the global constructors.
 	call _init
-
+	push %ebx             # Заталкиваем указатель на Multiboot структуру в стек
+	push %eax             # Заталкиваем магическое число (0x2BADB002) для проверки
 	# Transfer control to the main kernel.
 	call kernel_main
 

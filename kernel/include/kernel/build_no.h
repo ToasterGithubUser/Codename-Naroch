@@ -1,0 +1,6 @@
+#ifndef _KERNEL_BUILD_NO_H
+#define _KERNEL_BUILD_NO_H
+
+#define KERNEL_BUILD_NUMBER 182
+
+#endif

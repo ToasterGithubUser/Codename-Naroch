@@ -1,0 +1,56 @@
+#ifndef _KERNEL_FAT16_H
+#define _KERNEL_FAT16_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+// BIOS Parameter Block для FAT16 (строго упакованный, 512 байт)
+struct fat16_bpb {
+    uint8_t  jmp[3];
+    char     oem_name[8];
+    uint16_t bytes_per_sector;    // Обычно 512
+    uint8_t  sectors_per_cluster;  // Сколько секторов в одном кластере
+    uint16_t reserved_sectors;     // Зарезервированные сектора (включая этот)
+    uint8_t  num_fats;             // Количество таблиц FAT (обычно 2)
+    uint16_t root_dir_entries;     // Макс. количество файлов в корне (обычно 512)
+    uint16_t total_sectors_short;
+    uint8_t  media_type;
+    uint16_t sectors_per_fat;      // Сколько секторов занимает одна таблица FAT
+    uint16_t sectors_per_track;
+    uint16_t num_heads;
+    uint32_t hidden_sectors;
+    uint32_t total_sectors_large;
+    // Extended Boot Record
+    uint8_t  drive_number;
+    uint8_t  reserved;
+    uint8_t  boot_signature;
+    uint32_t volume_id;
+    char     volume_label[11];
+    char     fs_type[8];           // Должно быть "FAT16   "
+} __attribute__((packed));
+typedef struct fat16_bpb fat16_bpb_t;
+
+// Запись о файле/папке в каталоге FAT16 (32 байта)
+struct fat16_dir_entry {
+    char     name[8];              // Имя (8 символов)
+    char     ext[3];               // Расширение (3 символа)
+    uint8_t  attrib;               // Атрибуты (0x10 - папка, 0x20 - файл)
+    uint8_t  reserved;
+    uint8_t  creation_time_ms;
+    uint16_t creation_time;
+    uint16_t creation_date;
+    uint16_t last_access_date;
+    uint16_t first_cluster_high;   // Всегда 0 для FAT16
+    uint16_t last_mod_time;
+    uint16_t last_mod_date;
+    uint16_t first_cluster_low;    // Номер первого кластера данных в таблице FAT
+    uint32_t file_size;            // Размер файла в байтах
+} __attribute__((packed));
+typedef struct fat16_dir_entry fat16_dir_entry_t;
+
+// Интерфейс ФС
+void fat16_init(uint32_t mem_addr, uint32_t size);
+void fat16_ls(void);
+void fat16_cat(const char* filename);
+
+#endif

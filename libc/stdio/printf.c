@@ -3,7 +3,10 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <kernel/mutex.h>
 
+// Мьютекс для защиты физического экрана VGA и каретки TTY
+extern mutex_t tty_mutex; 
 static bool print(const char* data, size_t length) {
 	const unsigned char* bytes = (const unsigned char*) data;
 	for (size_t i = 0; i < length; i++)
