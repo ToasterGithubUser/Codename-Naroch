@@ -7,11 +7,9 @@ mkdir -p isodir/boot
 mkdir -p isodir/boot/grub
 
 cp $SYSROOT/boot/myos.kernel isodir/boot/myos.kernel
-cp fat16.img isodir/boot/fat16.img
 cat > isodir/boot/grub/grub.cfg << EOF
 menuentry "myos" {
 	multiboot /boot/myos.kernel
-	module /boot/fat16.img
 }
 EOF
 grub-mkrescue -o myos.iso isodir

@@ -28,6 +28,14 @@ void tty_create_vterms(void) {
         vterms[i]->shell_capacity = 32; // Стартовая емкость
         vterms[i]->shell_buf = (char*)kmalloc(vterms[i]->shell_capacity);
         vterms[i]->shell_idx = 0;
+        vterms[i]->history_count = 0;
+        vterms[i]->history_next = 0;
+        vterms[i]->history_position = 0;
+        vterms[i]->history_draft = 0;
+        vterms[i]->history_draft_length = 0;
+        for (size_t j = 0; j < TTY_COMMAND_HISTORY_SIZE; j++) {
+            vterms[i]->command_history[j] = 0;
+        }
 
         for (size_t y = 0; y < VGA_HEIGHT; y++) {
             for (size_t x = 0; x < VGA_WIDTH; x++) {
@@ -153,6 +161,12 @@ void terminal_putchar(char c) {
         case '\b':
             if (tty->column > 0) {
                 tty->column--;
+            } else if (tty->row > 0) {
+                tty->row--;
+                tty->column = VGA_WIDTH - 1;
+            } else {
+                mutex_unlock(&tty_mutex);
+                return;
             }
             // Стираем символ как в локальном буфере кучи, так и на физическом экране
             tty->buffer[tty->row * VGA_WIDTH + tty->column] = vga_entry(' ', tty->color);

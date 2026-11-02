@@ -21,9 +21,9 @@ void paging_install(void) {
         
         for (uint32_t i = 0; i < 1024; i++) {
             uint32_t physical_address = (t * 4 * 1024 * 1024) + (i * 4096);
-            page_table[i] = physical_address | 3; 
+            page_table[i] = physical_address | 7; 
         }
-        page_directory[t] = ((uint32_t)page_table) | 3;
+        page_directory[t] = ((uint32_t)page_table) | 7;
     }
 
     // НАДЁЖНОЕ ВКЛЮЧЕНИЕ ПЕЙДЖИНГА С ОЧИСТКОЙ КОНВЕЙЕРА x86
