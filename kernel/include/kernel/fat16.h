@@ -48,9 +48,11 @@ struct fat16_dir_entry {
 } __attribute__((packed));
 typedef struct fat16_dir_entry fat16_dir_entry_t;
 
-// Интерфейс ФС
-void fat16_init(uint32_t mem_addr, uint32_t size);
+// Mount a FAT16 partition from the primary-master ATA disk.
+void fat16_init(void);
 void fat16_ls(void);
 void fat16_cat(const char* filename);
+void fat16_touch(const char* filename);
+void fat16_write(const char* filename, const char* data);
 
 #endif

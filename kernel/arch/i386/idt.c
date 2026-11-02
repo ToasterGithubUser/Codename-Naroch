@@ -46,8 +46,8 @@ static void pic_remap(void) {
     outb(0xA1, 0x02);
     outb(0x21, 0x01);
     outb(0xA1, 0x01);
-    outb(0x21, 0x0);  // Разрешить все прерывания
-    outb(0xA1, 0x0);
+    outb(0x21, 0xFC); // Enable only timer and keyboard IRQs.
+    outb(0xA1, 0xFF); // ATA PIO is polled; no slave IRQ handlers are installed.
 }
 
 void idt_install(void) {

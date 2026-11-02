@@ -2,6 +2,7 @@
 #define _KERNEL_TTY_H
 #define VGA_WIDTH 80
 #define VGA_HEIGHT 25
+#define TTY_COMMAND_HISTORY_SIZE 8
 #include <stddef.h>
 #include <stdint.h>
 
@@ -16,6 +17,12 @@ typedef struct {
     char* shell_buf;        // Указатель на динамический буфер командной строки
     size_t shell_idx;       // Текущая длина строки (индекс ввода)
     size_t shell_capacity;  // ВАЖНО: Текущая емкость буфера в байтах
+    char* command_history[TTY_COMMAND_HISTORY_SIZE];
+    size_t history_count;
+    size_t history_next;
+    size_t history_position;
+    char* history_draft;
+    size_t history_draft_length;
 } virtual_tty_t;
 
 

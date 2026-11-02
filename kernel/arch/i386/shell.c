@@ -29,6 +29,141 @@ int strcmp(const char *s1, const char *s2) {
     return *(const unsigned char *)s1 - *(const unsigned char *)s2;
 }
 
+static char* parse_filename_argument(char* argument) {
+    if (*argument != '"') {
+        return argument;
+    }
+
+    char* filename = argument + 1;
+    char* end = filename;
+    while (*end && *end != '"') {
+        end++;
+    }
+    if (!*end || end[1] != '\0') {
+        return 0;
+    }
+    *end = '\0';
+    return filename;
+}
+
+static int shell_reserve(virtual_tty_t* tty, size_t required) {
+    if (required <= tty->shell_capacity) {
+        return 1;
+    }
+
+    size_t capacity = tty->shell_capacity;
+    while (capacity < required) {
+        capacity += 32;
+    }
+    char* new_buffer = (char*)kmalloc(capacity);
+    if (!new_buffer) {
+        return 0;
+    }
+    memcpy(new_buffer, tty->shell_buf, tty->shell_idx);
+    new_buffer[tty->shell_idx] = '\0';
+    kfree(tty->shell_buf);
+    tty->shell_buf = new_buffer;
+    tty->shell_capacity = capacity;
+    return 1;
+}
+
+static void shell_replace_input(virtual_tty_t* tty, const char* text,
+                                size_t length) {
+    while (tty->shell_idx) {
+        terminal_putchar('\b');
+        tty->shell_idx--;
+    }
+    tty->shell_buf[0] = '\0';
+
+    if (!shell_reserve(tty, length + 1)) {
+        printf("Shell: Not enough memory to restore command line.\n");
+        return;
+    }
+    memcpy(tty->shell_buf, text, length);
+    tty->shell_buf[length] = '\0';
+    tty->shell_idx = length;
+    terminal_write(text, length);
+}
+
+static void shell_clear_history_navigation(virtual_tty_t* tty) {
+    tty->history_position = 0;
+    if (tty->history_draft) {
+        kfree(tty->history_draft);
+        tty->history_draft = 0;
+    }
+    tty->history_draft_length = 0;
+}
+
+static void shell_remember_command(virtual_tty_t* tty) {
+    if (!tty->shell_idx) {
+        return;
+    }
+
+    char* command = (char*)kmalloc(tty->shell_idx + 1);
+    if (!command) {
+        printf("Shell: Not enough memory to save command history.\n");
+        return;
+    }
+    memcpy(command, tty->shell_buf, tty->shell_idx + 1);
+
+    if (tty->command_history[tty->history_next]) {
+        kfree(tty->command_history[tty->history_next]);
+    }
+    tty->command_history[tty->history_next] = command;
+    tty->history_next =
+        (tty->history_next + 1) % TTY_COMMAND_HISTORY_SIZE;
+    if (tty->history_count < TTY_COMMAND_HISTORY_SIZE) {
+        tty->history_count++;
+    }
+}
+
+void shell_history_up(void) {
+    virtual_tty_t* tty = tty_get_current();
+    if (!tty || !tty->history_count ||
+        tty->history_position >= tty->history_count) {
+        return;
+    }
+
+    if (!tty->history_position) {
+        tty->history_draft = (char*)kmalloc(tty->shell_idx + 1);
+        if (!tty->history_draft) {
+            printf("Shell: Not enough memory to navigate command history.\n");
+            return;
+        }
+        memcpy(tty->history_draft, tty->shell_buf, tty->shell_idx);
+        tty->history_draft[tty->shell_idx] = '\0';
+        tty->history_draft_length = tty->shell_idx;
+    }
+
+    tty->history_position++;
+    size_t index = (tty->history_next + TTY_COMMAND_HISTORY_SIZE -
+                    tty->history_position) % TTY_COMMAND_HISTORY_SIZE;
+    const char* command = tty->command_history[index];
+    shell_replace_input(tty, command, strlen(command));
+}
+
+void shell_history_down(void) {
+    virtual_tty_t* tty = tty_get_current();
+    if (!tty || !tty->history_position) {
+        return;
+    }
+
+    tty->history_position--;
+    if (!tty->history_position) {
+        shell_replace_input(tty, tty->history_draft,
+                            tty->history_draft_length);
+        kfree(tty->history_draft);
+        tty->history_draft = 0;
+        tty->history_draft_length = 0;
+        return;
+    }
+
+    size_t index = (tty->history_next + TTY_COMMAND_HISTORY_SIZE -
+                    tty->history_position) % TTY_COMMAND_HISTORY_SIZE;
+    const char* command = tty->command_history[index];
+    shell_replace_input(tty, command, strlen(command));
+}
+
 void shell_prompt(void) {
     terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
     printf("naroch> ");
@@ -41,14 +176,11 @@ void shell_input_char(char c) {
     if (c == '\n') {
         terminal_putchar('\n');
         tty->shell_buf[tty->shell_idx] = '\0'; // Финализируем строку в TTY
-        
+        shell_remember_command(tty);
+        shell_clear_history_navigation(tty);
         shell_execute(); // Выполняем команду
-        if (tty->shell_capacity > 32) {
-            kfree(tty->shell_buf);
-            tty->shell_capacity = 32;
-            tty->shell_buf = (char*)kmalloc(tty->shell_capacity);
-        }
         tty->shell_idx = 0; // Сбрасываем индекс активной консоли
+        tty->shell_buf[0] = '\0';
         shell_prompt();
     } 
     else if (c == '\b') {
@@ -58,23 +190,13 @@ void shell_input_char(char c) {
         }
     } 
     else {
-        // Безопасное сохранение в буфер виртуального окна (лимит 256 байт)
-        if (tty->shell_idx >= tty->shell_capacity - 1) {
-            size_t new_capacity = tty->shell_capacity + 32; // Увеличиваем шаг на 32 байта
-            char* new_buffer = (char*)kmalloc(new_capacity);
-            
-            // Копируем старые накопленные символы в новый блок кучи
-            for (size_t i = 0; i < tty->shell_idx; i++) {
-                new_buffer[i] = tty->shell_buf[i];
-            }
-            
-            kfree(tty->shell_buf); // Освобождаем старый маленький буфер
-            tty->shell_buf = new_buffer;
-            tty->shell_capacity = new_capacity;
+        if (!shell_reserve(tty, tty->shell_idx + 2)) {
+            printf("Shell: Not enough memory for command line.\n");
+            return;
         }
         
-        // Безопасно сохраняем символ
         tty->shell_buf[tty->shell_idx++] = c;
+        tty->shell_buf[tty->shell_idx] = '\0';
         terminal_putchar(c);
     }
     
@@ -100,7 +222,9 @@ void shell_execute(void) {
         printf("  ktest   - Test Kernel Heap allocation\n");
         printf("  pagefault - Trigger page fault exception\n");
         printf("  ls      - List files in the FAT16 root directory\n");
-        printf("  cat <file> - Display a FAT16 file\n");
+        printf("  cat <file> - Display a FAT16 file (quote names with spaces)\n");
+        printf("  touch <file> - Create an empty file (long names supported)\n");
+        printf("  write <file> <data> - Create or replace a file (quote spaces)\n");
     } 
     else if (strcmp(cmd, "shellstat") == 0) {
         char diag_buf[32];
@@ -139,10 +263,51 @@ void shell_execute(void) {
     else if (strcmp(cmd, "ls") == 0) {
         fat16_ls();
     }
+    // Внутри shell_execute() в вашем shell.c:
+    else if (strncmp(cmd, "touch ", 6) == 0) {
+        char* filename = parse_filename_argument(cmd + 6);
+        if (filename) {
+            fat16_touch(filename);
+        } else {
+            printf("Usage: touch <filename> (quote names containing spaces)\n");
+        }
+    }
     // Команда cat ожидает имя файла, поэтому проверяем подстроку через strncmp
     else if (strncmp(cmd, "cat ", 4) == 0) {
-        // cmd + 4 указывает на начало имени файла (пропускаем "cat ")
-        fat16_cat(cmd + 4);
+        char* filename = parse_filename_argument(cmd + 4);
+        if (filename) {
+            fat16_cat(filename);
+        } else {
+            printf("Usage: cat <filename> (quote names containing spaces)\n");
+        }
+    }
+    else if (strncmp(cmd, "write ", 6) == 0) {
+        char* filename = cmd + 6;
+        char* data;
+        if (*filename == '"') {
+            filename++;
+            data = filename;
+            while (*data && *data != '"') {
+                data++;
+            }
+            if (!*data || data[1] != ' ') {
+                printf("Usage: write <filename> <data> (quote names containing spaces)\n");
+                return;
+            }
+            *data++ = '\0';
+            data++;
+        } else {
+            data = filename;
+            while (*data && *data != ' ') {
+                data++;
+            }
+            if (!*data) {
+                printf("Usage: write <filename> <data>\n");
+                return;
+            }
+            *data++ = '\0';
+        }
+        fat16_write(filename, data);
     }
     else if (strcmp(cmd, "malloc") == 0) {
         extern uint32_t pmm_max_blocks;

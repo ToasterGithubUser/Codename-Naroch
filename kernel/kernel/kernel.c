@@ -19,6 +19,7 @@ extern char kernel_start     __attribute__((weak));
 extern char kernel_end       __attribute__((weak));
 extern char start            __attribute__((weak));
 extern char end              __attribute__((weak));
+extern void switch_to_user(void (*entry_point)(void));
 
 static inline uint32_t get_kernel_start(void) {
     if (&_kernel_start != NULL) return (uint32_t)&_kernel_start;
@@ -47,6 +48,14 @@ void dummy_task_B(void) {
     while (1) {
         printf("[B]");
         sleep(300); // Спим 300 мс
+    }
+}
+void my_user_program(void) {
+    // ВНИМАНИЕ: Здесь пока нельзя вызывать printf или работать с диском напрямую,
+    // так как процессор в Ring 3 моментально выкинет General Protection Fault!
+    // Мы просто проверим выполнение в бесконечном цикле.
+    while (1) {
+        asm volatile("nop"); 
     }
 }
 void kernel_main(uint32_t magic, multiboot_info_t* mboot_ptr) {
@@ -104,15 +113,7 @@ void kernel_main(uint32_t magic, multiboot_info_t* mboot_ptr) {
     //task_create(dummy_task_B);
     // 3. ИНИЦИАЛИЗИРУЕМ ТЕРМИНАЛ VGA (он безопасно заберет выровненную память)
     terminal_initialize();
-    if (mboot_ptr->flags & (1 << 3) && mboot_ptr->mods_count > 0) {
-        uint32_t* mod_info = (uint32_t*)mboot_ptr->mods_addr;
-        uint32_t module_start = mod_info[0];
-        uint32_t module_size = mod_info[1] - module_start;
-
-        // Инициализируем настоящую FAT16 ФС!
-        fat16_init(module_start, module_size);
-        pmm_init_region(module_start, module_size);
-    }
+    fat16_init();
     // Вывод логов
     terminal_writestring("Hardware Paging enabled successfully.\n");
     terminal_writestring("NaroSH Build ");
@@ -129,7 +130,12 @@ void kernel_main(uint32_t magic, multiboot_info_t* mboot_ptr) {
     shell_prompt();
 
     asm volatile("sti");
+    terminal_writestring("Jumping to User Mode (Ring 3)... Goodbye Ring 0!\n");
+    
+    switch_to_user(my_user_program); // Процессор улетает в Ring 3!
+    
     while(1) {
         asm volatile("hlt");
     }
+        
 }

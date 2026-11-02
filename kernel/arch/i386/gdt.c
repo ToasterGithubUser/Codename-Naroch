@@ -2,13 +2,10 @@
 #include <string.h>
 // Our table contains 3 entries: Null, Kernel Code, Kernel Data
 // Теперь у нас 4 записи в GDT
-gdt_entry_t gdt_entries[4]; 
+gdt_entry_t gdt_entries[6]; 
 gdt_ptr_t   gdt_ptr;
-tss_entry_t tss_entry; // Сама структура TSS
+tss_entry_t tss_entry; 
 
-gdt_ptr_t   gdt_ptr;
-
-// Internal function to set up a descriptor entry
 static void gdt_set_gate(int32_t num, uint32_t base, uint32_t limit, uint8_t access, uint8_t gran) {
     gdt_entries[num].base_low    = (base & 0xFFFF);
     gdt_entries[num].base_middle = (base >> 16) & 0xFF;
@@ -23,7 +20,7 @@ static void gdt_set_gate(int32_t num, uint32_t base, uint32_t limit, uint8_t acc
 
 void gdt_install(void) {
     // Размер GDT теперь под 4 элемента
-    gdt_ptr.limit = (sizeof(gdt_entry_t) * 4) - 1;
+    gdt_ptr.limit = (sizeof(gdt_entry_t) * 6) - 1;
     gdt_ptr.base  = (uint32_t)&gdt_entries;
 
     // 1. Null segment
@@ -35,27 +32,27 @@ void gdt_install(void) {
     // 3. Kernel Data Segment (0x10)
     gdt_set_gate(2, 0, 0xFFFFFFFF, 0x92, 0xCF);
 
+    // 4. User Code Segment (Смещение: 3 * 8 = 24 = 0x18 | 3 для RPL = 0x1B)
+    gdt_set_gate(3, 0, 0xFFFFFFFF, 0xFA, 0xCF);
+
+    // 5. User Data Segment (Смещение: 4 * 8 = 32 = 0x20 | 3 для RPL = 0x23)
+    gdt_set_gate(4, 0, 0xFFFFFFFF, 0xF2, 0xCF);
     // --- НАСТРОЙКА СТРУКТУРЫ TSS ---
     memset(&tss_entry, 0, sizeof(tss_entry_t));
-    
-    tss_entry.ss0  = 0x10;  // Сегмент стека ядра равен сегменту данных ядра (0x10)
-    
-    // Задаем адрес стека ядра. В Meaty Skeleton стек растет вниз.
-    // Мы можем взять адрес текущего указателя стека ядра через ассемблер:
+    tss_entry.ss0  = 0x10;  
+    tss_entry.iomap_base = sizeof(tss_entry_t);
     uint32_t esp;
     asm volatile("mov %%esp, %0" : "=r"(esp));
-    tss_entry.esp0 = esp;   // Процессор прыгнет на этот безопасный стек при прерывании в Ring 3
+    tss_entry.esp0 = esp;   
 
-    // 4. Добавляем TSS в GDT под индексом 3 (Смещение в байтах: 3 * 8 = 24 = 0x18)
-    // Доступ: 0x89 (Присутствует, Ring 0, тип: 32-bit TSS доступен)
     uint32_t tss_base = (uint32_t)&tss_entry;
-    uint32_t tss_limit = tss_base + sizeof(tss_entry_t);
-    gdt_set_gate(3, tss_base, tss_limit, 0x89, 0x00);
+    uint32_t tss_limit = sizeof(tss_entry_t) - 1;
+    gdt_set_gate(5, tss_base, tss_limit, 0x89, 0x00);
 
-    // Загружаем GDT и принудительно сообщаем процессору о новом TSS через ltr
+    // Загружаем GDT и сообщаем процессору о TSS (теперь индекс ворот 0x28!)
     asm volatile(
-        "lgdt %0\n\t"            // Загрузка GDT
-        "ljmp $0x08, $1f\n\t"   // Дальний прыжок для сброса CS
+        "lgdt %0\n\t"            
+        "ljmp $0x08, $1f\n\t"   
         "1:\n\t"
         "mov $0x10, %%ax\n\t"
         "mov %%ax, %%ds\n\t"
@@ -63,11 +60,8 @@ void gdt_install(void) {
         "mov %%ax, %%fs\n\t"
         "mov %%ax, %%gs\n\t"
         "mov %%ax, %%ss\n\t"
-        "mov $0x18, %%ax\n\t"    // 0x18 указывает на нашу 3-ю запись в GDT (TSS)
-        "ltr %%ax\n\t"           // ЛОАД РЕГИСТРА TSS (Load Task Register) [OSDev Wiki Task State Segment]
-        :
-        : "m"(gdt_ptr)
-        : "ax"
+        "mov $0x28, %%ax\n\t"    // 0x28 указывает на нашу 5-ю запись в GDT (TSS)
+        "ltr %%ax\n\t"           
+        : : "m"(gdt_ptr) : "ax"
     );
 }
-

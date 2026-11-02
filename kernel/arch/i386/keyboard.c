@@ -18,26 +18,90 @@ static const char kbdus[128] = {
     // Остальные клавиши (F1-F12, Keypad) при необходимости можно дописать ниже
 };
 
+static int left_shift;
+static int right_shift;
+static int extended_scancode;
+
+static char shifted_character(char c) {
+    if (c >= 'a' && c <= 'z') {
+        return c - ('a' - 'A');
+    }
+
+    switch (c) {
+        case '1': return '!';
+        case '2': return '@';
+        case '3': return '#';
+        case '4': return '$';
+        case '5': return '%';
+        case '6': return '^';
+        case '7': return '&';
+        case '8': return '*';
+        case '9': return '(';
+        case '0': return ')';
+        case '-': return '_';
+        case '=': return '+';
+        case '[': return '{';
+        case ']': return '}';
+        case ';': return ':';
+        case '\'': return '"';
+        case '`': return '~';
+        case '\\': return '|';
+        case ',': return '<';
+        case '.': return '>';
+        case '/': return '?';
+        default: return c;
+    }
+}
+
 void keyboard_handler(void) {
     uint8_t scancode = inb(0x60);
 
-    if (scancode & 0x80) {
-        return; 
+    if (scancode == 0xE0) {
+        extended_scancode = 1;
+        return;
     }
+
+    int extended = extended_scancode;
+    extended_scancode = 0;
+    uint8_t keycode = scancode & 0x7F;
+    int released = (scancode & 0x80) != 0;
+
+    if (!extended && keycode == 0x2A) {
+        left_shift = !released;
+        return;
+    }
+    if (!extended && keycode == 0x36) {
+        right_shift = !released;
+        return;
+    }
+    if (released) {
+        return;
+    }
+
+    if (extended) {
+        if (keycode == 0x48) {
+            shell_history_up();
+        } else if (keycode == 0x50) {
+            shell_history_down();
+        }
+        return;
+    }
+
     // --- ПЕРЕХВАТ ГОРЯЧИХ КЛАВИШ F1 И F2 ---
-    if (scancode == 0x3B) { // Скан-код F1
+    if (keycode == 0x3B) { // Скан-код F1
         tty_switch(0);      // Переключаемся на Терминал 0
         return;
     }
-    if (scancode == 0x3C) { // Скан-код F2
+    if (keycode == 0x3C) { // Скан-код F2
         tty_switch(1);      // Переключаемся на Терминал 1
         return;
     }
-    if (scancode < 128) {
-        char c = kbdus[scancode];
-        if (c != 0) {
-            // ВМЕСТО terminal_putchar(c) вызываем наш обработчик Shell:
-            shell_input_char(c); 
-        }
+
+    char c = kbdus[keycode];
+    if ((left_shift || right_shift) && c) {
+        c = shifted_character(c);
+    }
+    if (c != 0) {
+        shell_input_char(c);
     }
 }
