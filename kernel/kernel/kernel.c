@@ -12,6 +12,12 @@
 #include <kernel/heap.h>
 #include <kernel/task.h>
 #include <kernel/fat16.h>
+#include <kernel/ring3.h>
+#include <kernel/serial.h>
+#include <kernel/rtc.h>
+#include <kernel/syscall.h>
+#include <kernel/vfs.h>
+#include <string.h>
 // Объявляем возможные альтернативные имена, которые генерируют разные версии linker.ld
 extern char _kernel_start    __attribute__((weak));
 extern char _kernel_end      __attribute__((weak));
@@ -19,7 +25,29 @@ extern char kernel_start     __attribute__((weak));
 extern char kernel_end       __attribute__((weak));
 extern char start            __attribute__((weak));
 extern char end              __attribute__((weak));
-extern void switch_to_user(void (*entry_point)(void));
+extern char user_mode_demo_start[];
+extern char user_mode_demo_end[];
+
+volatile ring3_test_state_t* ring3_test_state;
+
+static void idle_task(void) {
+    shell_prompt();
+    for (;;) {
+        shell_process_pending();
+        uint8_t character;
+        while (serial_read_char(&character)) {
+            if (character == '\r') {
+                character = '\n';
+            } else if (character == 0x7F) {
+                character = '\b';
+            }
+            if (!syscall_console_input((char)character)) {
+                shell_input_char((char)character);
+            }
+        }
+        asm volatile("sti; hlt");
+    }
+}
 
 static inline uint32_t get_kernel_start(void) {
     if (&_kernel_start != NULL) return (uint32_t)&_kernel_start;
@@ -48,14 +76,6 @@ void dummy_task_B(void) {
     while (1) {
         printf("[B]");
         sleep(300); // Спим 300 мс
-    }
-}
-void my_user_program(void) {
-    // ВНИМАНИЕ: Здесь пока нельзя вызывать printf или работать с диском напрямую,
-    // так как процессор в Ring 3 моментально выкинет General Protection Fault!
-    // Мы просто проверим выполнение в бесконечном цикле.
-    while (1) {
-        asm volatile("nop"); 
     }
 }
 void kernel_main(uint32_t magic, multiboot_info_t* mboot_ptr) {
@@ -99,6 +119,7 @@ void kernel_main(uint32_t magic, multiboot_info_t* mboot_ptr) {
         pmm_deinit_region(0x800000, total_memory - 0x800000);
     }
 
+    pmm_init_region(0, 0x100000);
     uint32_t kernel_size = pmm_bitmap_start - get_kernel_start();
     uint32_t bitmap_size = pmm_max_blocks / 8;
     pmm_init_region(get_kernel_start(), kernel_size + bitmap_size);
@@ -113,7 +134,9 @@ void kernel_main(uint32_t magic, multiboot_info_t* mboot_ptr) {
     //task_create(dummy_task_B);
     // 3. ИНИЦИАЛИЗИРУЕМ ТЕРМИНАЛ VGA (он безопасно заберет выровненную память)
     terminal_initialize();
+    serial_init();
     fat16_init();
+    vfs_init();
     // Вывод логов
     terminal_writestring("Hardware Paging enabled successfully.\n");
     terminal_writestring("NaroSH Build ");
@@ -123,19 +146,28 @@ void kernel_main(uint32_t magic, multiboot_info_t* mboot_ptr) {
 
     timer_install(100); 
     char mem_print_buf[32];
-    inttostr(total_memory / (1024 * 1024), mem_print_buf);
+    inttostr(total_memory / (1024 ^ 2), mem_print_buf);
     printf("\nDetected Real Physical RAM: "); printf(mem_print_buf); printf(" MB.\n");
     terminal_writestring("Type help for help.\n");
     
-    shell_prompt();
+    
 
-    asm volatile("sti");
     terminal_writestring("Jumping to User Mode (Ring 3)... Goodbye Ring 0!\n");
     
-    switch_to_user(my_user_program); // Процессор улетает в Ring 3!
-    
-    while(1) {
-        asm volatile("hlt");
+    uint32_t user_code_size =
+        (uint32_t)user_mode_demo_end - (uint32_t)user_mode_demo_start;
+
+    task_t* first_user_task =
+        task_create_user(user_mode_demo_start, user_code_size, 1);
+    if (!first_user_task ||
+        !task_create_user(user_mode_demo_start, user_code_size, 2) ||
+        !task_create_kernel(idle_task)) {
+        printf("Unable to initialize user processes.\n");
+        while (1) {
+            asm volatile("cli; hlt");
+        }
     }
-        
+
+    ring3_test_state = first_user_task->user_test_state;
+    task_start();
 }

@@ -1,6 +1,7 @@
 #include <kernel/keyboard.h>
 #include <kernel/tty.h>
 #include <kernel/shell.h>
+#include <kernel/syscall.h>
 // Вспомогательная функция чтения из I/O порта
 static inline uint8_t inb(uint16_t port) {
     uint8_t ret;
@@ -102,6 +103,8 @@ void keyboard_handler(void) {
         c = shifted_character(c);
     }
     if (c != 0) {
-        shell_input_char(c);
+        if (!syscall_console_input(c)) {
+            shell_input_char(c);
+        }
     }
 }

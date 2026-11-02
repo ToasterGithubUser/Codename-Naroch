@@ -65,3 +65,7 @@ void gdt_install(void) {
         : : "m"(gdt_ptr) : "ax"
     );
 }
+
+void gdt_set_kernel_stack(uint32_t stack_top) {
+    tss_entry.esp0 = stack_top;
+}

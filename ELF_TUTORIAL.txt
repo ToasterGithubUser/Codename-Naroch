@@ -1,0 +1,209 @@
+Naroch ELF program tutorial
+===========================
+
+This project runs static 32-bit i386 ELF executables built for Naroch. It does
+not run ordinary Linux executables: Linux system calls and dynamic linking
+are not implemented.
+
+Requirements
+------------
+
+Build the OS cross compiler and add it to PATH. The helper uses these tools
+from the default cross-compiler location:
+
+  $HOME/opt/cross/bin/i686-elf-gcc
+  $HOME/opt/cross/bin/i686-elf-g++
+
+The C++ compiler is only needed for .cpp inputs. The script builds and
+installs the Naroch user runtime into sysroot/ before compiling. Run commands
+below from the repository root in WSL.
+
+Write a program
+---------------
+
+Create hello.c:
+
+  #include <stdio.h>
+
+  int main(void) {
+      puts("Hello from Naroch!");
+      printf("The answer is %d (0x%x)\n", 42, 42);
+      return 0;
+  }
+
+Build one or more C source files:
+
+  ./compile-elf.sh hello.c
+
+This creates hello.elf in the current directory. Choose another output name:
+
+  ./compile-elf.sh -o greeting.elf hello.c
+
+Multiple source files can be linked into one program:
+
+  ./compile-elf.sh -o app.elf main.c helper.c
+
+The helper supplies startup code, a linker script, and the Naroch user
+runtime; you do not need to specify those manually. The output is a static
+ELF32/i386 ET_EXEC program. It accepts both .c and .cpp inputs, including
+multiple files.
+
+Run directly
+------------
+
+At the OS shell, run the program with its path:
+
+  ./hello.elf first-argument "argument with spaces"
+
+The program receives argc and argv in the usual C main signature. argc is
+limited to 16 including argv[0]; each argument is limited to 255 bytes.
+envp is empty. The shell waits for the program and prints its exit status.
+Append `&` to run it in the background. `exec hello.elf ...` remains available.
+
+Supported C runtime
+-------------------
+
+The startup code calls:
+
+  int main(int argc, char **argv, char **envp)
+
+The small C runtime provides printf, puts, putchar, write, read, open, close,
+lseek, spawn, waitpid, getpid, exit, abort, malloc, calloc, realloc, free, and
+basic memory/string functions.
+printf supports %s, %c, %%, %d, %i, %u, %x, %X, and %p. `sbrk` grows a
+per-process user heap; freed malloc blocks are reused.
+
+File access uses `<fcntl.h>` and `<unistd.h>`. Supported flags are O_RDONLY,
+O_WRONLY, O_RDWR, O_CREAT, O_TRUNC, and O_APPEND. For example:
+
+  int fd = open("note.txt", O_CREAT | O_TRUNC | O_RDWR);
+  write(fd, "hello", 5);
+  close(fd);
+
+  fd = open("note.txt", O_RDONLY);
+  char data[6] = {0};
+  read(fd, data, 5);
+  lseek(fd, 0, SEEK_SET);
+  close(fd);
+
+There are up to 16 open files per process; each file is limited to 1 MiB.
+`read` does not append a NUL byte. `lseek` supports `SEEK_SET`, `SEEK_CUR`,
+and `SEEK_END`, with positions limited to 1 MiB.
+Modified file contents are written to FAT16 by `close()`. The kernel also
+closes a process's open files when it exits; call `close()` explicitly when
+you need to check for a write error.
+
+The shell and ELF file syscalls use a small VFS interface. FAT16 is currently
+the only mounted filesystem backend; the interface centralizes path resolution
+and filesystem operations so another backend can be added without wiring it
+directly into shell commands and syscalls.
+
+The shell supports `rm file` for files and `rmdir directory` for empty
+directories. Both accept quoted names and paths. `rm` refuses directories and
+files currently open by an ELF process. `rmdir` refuses non-empty directories,
+the root directory, and the current directory or one of its parents. Directory
+creation, file creation, and ELF file I/O accept paths relative to the current
+directory or absolute paths.
+
+File descriptor 0 is line-buffered keyboard input. For example:
+
+  char line[64];
+  ssize_t length = read(0, line, sizeof(line));
+
+Type a line and press Enter; input is echoed and Backspace edits the current
+line. The returned bytes include the newline when the buffer is large enough.
+There is no general POSIX library.
+
+Programs can create and wait for child ELF processes:
+
+  char *child_arguments[] = {"./child.elf", "hello", 0};
+  int child = spawn("./child.elf", child_arguments);
+  int status;
+  if (child >= 0 && waitpid(child, &status, 0) == child) {
+      printf("child exited with %d\n", status);
+  }
+
+`spawn` accepts up to 16 arguments. `waitpid` currently supports options 0
+and blocks until that child exits; `status` receives its exit code. The
+runtime also provides `getpid()`. Child processes inherit no open files.
+
+C++ support is intentionally small. The helper enables C++17 syntax, global
+constructors/destructors, basic `new`/`delete`, and the same C runtime. C++
+exceptions and RTTI are disabled; libstdc++, iostream, and the broader C++
+standard library are not provided. For example, save this as `hello.cpp` and
+build it with `./compile-elf.sh hello.cpp`:
+
+  #include <new>
+  #include <stdio.h>
+
+  class Greeting {
+  public:
+      Greeting() { puts("constructed"); }
+      ~Greeting() { puts("destroyed"); }
+  };
+
+  Greeting greeting;
+
+  int main(int argc, char **argv) {
+      int *value = new int(42);
+      printf("argc=%d value=%d\n", argc, *value);
+      delete value;
+      return 0;
+  }
+
+Install and run from FAT16
+--------------------------
+
+Build and copy the executable into the root of the OS FAT16 image in one step:
+
+  ./compile-elf.sh --install hello.c
+
+By default, `--install` targets `fat16.img` in the repository. Choose another
+image with `--install=/path/to/fat16.img`. The script requires `mcopy` from
+`mtools`; without `--install`, it only builds the ELF. You can also copy it
+manually:
+
+  mcopy -o -i fat16.img hello.elf ::HELLO.ELF
+
+Boot the OS, then enter this command at the Naroch shell:
+
+  ./hello.elf
+
+The shell matches filenames case-insensitively. You can list the image files
+from WSL with:
+
+  mdir -i fat16.img ::
+
+The FAT16 image already contains HELLO.ELF, which prints a greeting.
+
+Storage controller
+------------------
+
+The kernel probes PCI for a supported AHCI controller first and uses an
+available SATA port when found. If AHCI is unavailable, it falls back to
+primary-master ATA PIO. The boot log reports the selected backend.
+
+To run QEMU with an AHCI-backed FAT16 disk:
+
+  qemu-system-i386 -M q35 -m 128M -boot order=d \
+    -cdrom myos.iso \
+    -drive if=none,id=osdisk,file=fat16.img,format=raw \
+    -device ich9-ahci,id=ahci \
+    -device ide-hd,drive=osdisk,bus=ahci.0
+
+The default `qemu.sh` configuration uses a PC machine with an IDE disk, which
+exercises the ATA PIO fallback.
+
+Other devices
+-------------
+
+The kernel initializes COM1 (16550-compatible UART) as a serial console.
+Terminal output is mirrored to the serial port, and serial input is polled by
+the idle task and sent to the shell or the foreground program's stdin. In
+QEMU, the serial console is available through the configured serial backend;
+the default backend can be accessed from the QEMU terminal.
+
+The CMOS real-time clock is read on demand. Use `date` in the shell to display
+its date and time, and `devices` to check the UART, RTC, and selected disk
+backend. The displayed clock uses the value configured in the virtual
+machine's CMOS; QEMU commonly exposes UTC.

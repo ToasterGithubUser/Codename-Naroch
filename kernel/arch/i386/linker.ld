@@ -19,6 +19,13 @@ SECTIONS
 		*(.text)
 	}
 
+	.usertext BLOCK(4K) : ALIGN(4K)
+	{
+		__usertext_start = .;
+		KEEP(*(.usertext))
+		__usertext_end = .;
+	}
+
 	/* Read-only data. */
 	.rodata BLOCK(4K) : ALIGN(4K)
 	{
@@ -37,6 +44,8 @@ SECTIONS
 		*(COMMON)
 		*(.bss)
 	}
+
+	ASSERT(SIZEOF(.usertext) <= 4K, "user-mode demo code exceeds one page")
 
 	/* The compiler may produce other sections, put them in the proper place in
 	   in this file, if you'd like to include them in the final kernel. */

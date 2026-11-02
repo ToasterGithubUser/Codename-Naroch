@@ -3,6 +3,7 @@
 
 // Добавляет символ в буфер командной строки
 void shell_input_char(char c);
+void shell_process_pending(void);
 void shell_history_up(void);
 void shell_history_down(void);
 

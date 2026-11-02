@@ -7,8 +7,8 @@ void abort(void) {
 	// TODO: Add proper kernel panic.
 	printf("kernel: panic: abort()\n");
 #else
-	// TODO: Abnormally terminate the process as if by SIGABRT.
 	printf("abort()\n");
+	exit(134);
 #endif
 	while (1) { }
 	__builtin_unreachable();

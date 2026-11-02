@@ -5,6 +5,7 @@
 uint32_t* pmm_bitmap = 0;
 uint32_t  pmm_max_blocks = 0;
 uint32_t  pmm_used_blocks = 0;
+static uint32_t pmm_first_allocatable_block;
 
 static inline void bitmap_set(uint32_t bit) {
     pmm_bitmap[bit / 32] |= (1U << (bit % 32)); // 1U гарантирует беззнаковый сдвиг
@@ -21,10 +22,13 @@ static inline int bitmap_test(uint32_t bit) {
 
 static int bitmap_first_free(void) {
     uint32_t num_words = pmm_max_blocks / 32;
-    for (uint32_t i = 0; i < num_words; i++) {
+    uint32_t first_word = pmm_first_allocatable_block / 32;
+    uint32_t first_bit = pmm_first_allocatable_block % 32;
+    for (uint32_t i = first_word; i < num_words; i++) {
         // Если ячейка не забита единицами, внутри точно есть хоть один ноль (свободная страница)
         if (pmm_bitmap[i] != 0xFFFFFFFF) { 
-            for (int j = 0; j < 32; j++) {
+            uint32_t start_bit = i == first_word ? first_bit : 0;
+            for (uint32_t j = start_bit; j < 32; j++) {
                 if (!(pmm_bitmap[i] & (1U << j))) {
                     return i * 32 + j;
                 }
@@ -38,6 +42,13 @@ void pmm_init(uint32_t mem_size, uint32_t bitmap_address) {
     pmm_max_blocks = mem_size / PMM_BLOCK_SIZE;
     pmm_bitmap = (uint32_t*)bitmap_address;
     pmm_used_blocks = pmm_max_blocks; // Изначально считаем всю память занятой
+    uint64_t bitmap_end = (uint64_t)bitmap_address +
+        (pmm_max_blocks + 7U) / 8U;
+    pmm_first_allocatable_block =
+        (uint32_t)((bitmap_end + PMM_BLOCK_SIZE - 1) / PMM_BLOCK_SIZE);
+    if (pmm_first_allocatable_block < 0x100000U / PMM_BLOCK_SIZE) {
+        pmm_first_allocatable_block = 0x100000U / PMM_BLOCK_SIZE;
+    }
 
     // Заполняем битмап единицами напрямую через слова
     uint32_t num_words = pmm_max_blocks / 32;
@@ -53,6 +64,7 @@ void pmm_init_region(uint32_t base, size_t size) {
     for (uint32_t i = 0; i < blocks; i++) {
         uint32_t current_block = align + i;
         if (current_block >= pmm_max_blocks) break;
+        if (current_block < pmm_first_allocatable_block) continue;
         
         // Если блок еще не был занят, занимаем его
         if (!bitmap_test(current_block)) {
@@ -94,6 +106,9 @@ void* pmm_alloc_block(void) {
 
 void pmm_free_block(void* p) {
     uint32_t addr = (uint32_t)p;
+    if (addr / PMM_BLOCK_SIZE < pmm_first_allocatable_block) {
+        return;
+    }
     uint32_t frame = addr / PMM_BLOCK_SIZE;
 
     if (frame < pmm_max_blocks) {

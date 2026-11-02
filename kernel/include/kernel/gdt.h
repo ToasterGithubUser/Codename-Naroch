@@ -23,6 +23,7 @@ typedef struct gdt_ptr_struct gdt_ptr_t;
 
 // Function to initialize the GDT
 void gdt_install(void);
+void gdt_set_kernel_stack(uint32_t stack_top);
 // Структура TSS (Task State Segment) для x86
 struct tss_entry_struct {
     uint32_t prev_tss;   // Старый TSS, если используется аппаратное переключение задач

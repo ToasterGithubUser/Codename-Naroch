@@ -8,7 +8,13 @@
 #include <kernel/timer.h>
 #include <kernel/pmm.h>
 #include <kernel/heap.h>
-#include <kernel/fat16.h>
+#include <kernel/ring3.h>
+#include <kernel/task.h>
+#include <kernel/syscall.h>
+#include <kernel/serial.h>
+#include <kernel/rtc.h>
+#include <kernel/ata.h>
+#include <kernel/vfs.h>
 #include <string.h>
 int strncmp(const char *s1, const char *s2, size_t n) {
     while (n > 0 && *s1 && (*s1 == *s2)) {
@@ -44,6 +50,108 @@ static char* parse_filename_argument(char* argument) {
     }
     *end = '\0';
     return filename;
+}
+
+static int shell_parse_arguments(char* command, char* argv[],
+                                 int capacity) {
+    char* read = command;
+    char* write = command;
+    int argc = 0;
+    while (*read) {
+        while (*read == ' ' || *read == '\t') {
+            read++;
+        }
+        if (!*read) {
+            break;
+        }
+        if (argc == capacity) {
+            return -1;
+        }
+        argv[argc++] = write;
+        char quote = '\0';
+        while (*read) {
+            if ((*read == '"' || *read == '\'') &&
+                (!quote || quote == *read)) {
+                quote = quote ? '\0' : *read;
+                read++;
+                continue;
+            }
+            if (!quote && (*read == ' ' || *read == '\t')) {
+                break;
+            }
+            if (*read == '\\' && read[1] &&
+                (read[1] == '"' || read[1] == '\'' || read[1] == '\\')) {
+                read++;
+            }
+            *write++ = *read++;
+        }
+        if (quote) {
+            return -1;
+        }
+        if (*read) {
+            read++;
+        }
+        *write++ = '\0';
+    }
+    return argc;
+}
+
+static void shell_launch_elf(char* command) {
+    char* argv[16];
+    int argc = shell_parse_arguments(command, argv, 16);
+    if (argc <= 0) {
+        printf("Usage: ./program.elf [arguments] (quote arguments with spaces)\n");
+        return;
+    }
+
+    int background = argc > 1 && strcmp(argv[argc - 1], "&") == 0;
+    if (background) {
+        argc--;
+    }
+
+    const char* path = argv[0];
+    while (path[0] == '.' && path[1] == '/') {
+        path += 2;
+    }
+    if (!*path) {
+        printf("Executable path is empty.\n");
+        return;
+    }
+
+    void* image;
+    size_t image_size;
+    if (!vfs_read_file(path, &image, &image_size)) {
+        printf("Could not read executable: %s\n", argv[0]);
+        return;
+    }
+    int process_id;
+    int started = task_create_elf(image, image_size, argc,
+                                  (const char* const*)argv,
+                                  current_task ? current_task->pid : 0,
+                                  &process_id);
+    kfree(image);
+    if (!started) {
+        printf("Invalid ELF32/i386 executable or insufficient memory.\n");
+        return;
+    }
+    char pid[16];
+    inttostr((uint32_t)process_id, pid);
+    if (background) {
+        printf("Started background ELF process %s.\n", pid);
+        return;
+    }
+
+    syscall_set_foreground_pid(process_id);
+    int status = 0;
+    while (task_process_status(process_id, &status) == 0) {
+        task_yield();
+    }
+    syscall_set_foreground_pid(0);
+    printf("ELF process %s exited with status ", pid);
+    char exit_status[16];
+    inttostr((uint32_t)status, exit_status);
+    printf(exit_status);
+    printf(".\n");
 }
 
 static int shell_reserve(virtual_tty_t* tty, size_t required) {
@@ -166,22 +274,22 @@ void shell_history_down(void) {
 
 void shell_prompt(void) {
     terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
-    printf("naroch> ");
+    printf("naroch:%s> ", vfs_getcwd());
     terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK));
 }
 
 void shell_input_char(char c) {
     virtual_tty_t* tty = tty_get_current();
+    if (!tty || tty->command_active) {
+        return;
+    }
 
     if (c == '\n') {
         terminal_putchar('\n');
         tty->shell_buf[tty->shell_idx] = '\0'; // Финализируем строку в TTY
         shell_remember_command(tty);
         shell_clear_history_navigation(tty);
-        shell_execute(); // Выполняем команду
-        tty->shell_idx = 0; // Сбрасываем индекс активной консоли
-        tty->shell_buf[0] = '\0';
-        shell_prompt();
+        tty->command_pending = 1;
     } 
     else if (c == '\b') {
          if (tty->shell_idx > 0) {
@@ -199,7 +307,22 @@ void shell_input_char(char c) {
         tty->shell_buf[tty->shell_idx] = '\0';
         terminal_putchar(c);
     }
-    
+     
+}
+
+void shell_process_pending(void) {
+    virtual_tty_t* tty = tty_get_current();
+    if (!tty || !tty->command_pending || tty->command_active) {
+        return;
+    }
+
+    tty->command_active = 1;
+    tty->command_pending = 0;
+    shell_execute();
+    tty->shell_idx = 0;
+    tty->shell_buf[0] = '\0';
+    tty->command_active = 0;
+    shell_prompt();
 }
 
 void shell_execute(void) {
@@ -221,10 +344,21 @@ void shell_execute(void) {
         printf("  malloc  - Test PMM allocation\n");
         printf("  ktest   - Test Kernel Heap allocation\n");
         printf("  pagefault - Trigger page fault exception\n");
-        printf("  ls      - List files in the FAT16 root directory\n");
+        printf("  ls      - List the current FAT16 directory\n");
+        printf("  cd <dir> - Change the current FAT16 directory\n");
+        printf("  mkdir <dir> - Create a FAT16 directory\n");
+        printf("  rm <file> - Remove a file (not an open file)\n");
+        printf("  rmdir <dir> - Remove an empty directory\n");
         printf("  cat <file> - Display a FAT16 file (quote names with spaces)\n");
         printf("  touch <file> - Create an empty file (long names supported)\n");
         printf("  write <file> <data> - Create or replace a file (quote spaces)\n");
+        printf("  exec <file> [args] - Run a static ELF32 i386 executable\n");
+        printf("  ./app.elf [args] - Run an ELF directly with arguments\n");
+        printf("  ELF programs also support malloc/free and basic file I/O\n");
+        printf("  ring3check - Test user-mode access to kernel memory\n");
+        printf("  ring3check reports the boot-time user-mode protection test\n");
+        printf("  date    - Read the CMOS real-time clock\n");
+        printf("  devices - Show detected serial and storage devices\n");
     } 
     else if (strcmp(cmd, "shellstat") == 0) {
         char diag_buf[32];
@@ -249,6 +383,23 @@ void shell_execute(void) {
         printf("Architecture: i386 Protected Mode (Ring 0)\n");
         printf("Compiled on: "); printf(__DATE__); printf(" "); printf(__TIME__); printf("\n");
     }
+    else if (strcmp(cmd, "date") == 0) {
+        rtc_time_t time;
+        if (rtc_read_time(&time)) {
+            printf("%u-%u-%u %u:%u:%u\n", time.year, time.month, time.day,
+                   time.hour, time.minute, time.second);
+        } else {
+            printf("RTC time is unavailable or invalid.\n");
+        }
+    }
+    else if (strcmp(cmd, "devices") == 0) {
+        rtc_time_t time;
+        printf("COM1 serial: %s\n",
+               serial_is_available() ? "available" : "not detected");
+        printf("Storage: %s\n", ata_backend_name());
+        printf("CMOS RTC: %s\n",
+               rtc_read_time(&time) ? "available" : "not detected");
+    }
     else if (strcmp(cmd, "crash") == 0) {
         volatile int num = 5;
         volatile int zero = 0;
@@ -261,13 +412,64 @@ void shell_execute(void) {
         printf("Awake! PIT timer works perfectly.\n");
     }
     else if (strcmp(cmd, "ls") == 0) {
-        fat16_ls();
+        vfs_list();
+    }
+    else if (strncmp(cmd, "cd ", 3) == 0) {
+        char* path = parse_filename_argument(cmd + 3);
+        if (path) {
+            vfs_chdir(path);
+        } else {
+            printf("Usage: cd <directory> (quote names containing spaces)\n");
+        }
+    }
+    else if (strncmp(cmd, "mkdir ", 6) == 0) {
+        char* name = parse_filename_argument(cmd + 6);
+        if (name) {
+            vfs_mkdir(name);
+        } else {
+            printf("Usage: mkdir <directory> (quote names containing spaces)\n");
+        }
+    }
+    else if (strncmp(cmd, "rmdir ", 6) == 0) {
+        char* path = parse_filename_argument(cmd + 6);
+        if (!path) {
+            printf("Usage: rmdir <empty-directory> (quote names containing spaces)\n");
+        } else if (vfs_rmdir(path)) {
+            printf("Removed directory: %s\n", path);
+        } else {
+            printf("rmdir: cannot remove '%s' (not found, not empty, or current directory)\n",
+                   path);
+        }
+    }
+    else if (strncmp(cmd, "rm ", 3) == 0) {
+        char* path = parse_filename_argument(cmd + 3);
+        if (!path) {
+            printf("Usage: rm <file> (quote names containing spaces)\n");
+        } else if (vfs_unlink(path)) {
+            printf("Removed file: %s\n", path);
+        } else {
+            printf("rm: cannot remove '%s' (not found, a directory, or open)\n",
+                   path);
+        }
+    }
+    else if (strcmp(cmd, "ring3check") == 0) {
+        if (!ring3_test_state) {
+            printf("Ring 3 test is not initialized.\n");
+        } else if (ring3_test_state->result == RING3_TEST_RUNNING) {
+            printf("Ring 3 test is still running; try again shortly.\n");
+        } else if (ring3_test_state->result == RING3_TEST_BLOCKED) {
+            printf("PASS: Ring 3 was blocked from reading kernel memory.\n");
+        } else if (ring3_test_state->result == RING3_TEST_BYPASSED) {
+            printf("FAIL: Ring 3 read supervisor-only kernel memory.\n");
+        } else {
+            printf("Ring 3 protection test has not completed.\n");
+        }
     }
     // Внутри shell_execute() в вашем shell.c:
     else if (strncmp(cmd, "touch ", 6) == 0) {
         char* filename = parse_filename_argument(cmd + 6);
         if (filename) {
-            fat16_touch(filename);
+            vfs_touch(filename);
         } else {
             printf("Usage: touch <filename> (quote names containing spaces)\n");
         }
@@ -276,10 +478,13 @@ void shell_execute(void) {
     else if (strncmp(cmd, "cat ", 4) == 0) {
         char* filename = parse_filename_argument(cmd + 4);
         if (filename) {
-            fat16_cat(filename);
+            vfs_cat(filename);
         } else {
             printf("Usage: cat <filename> (quote names containing spaces)\n");
         }
+    }
+    else if (strncmp(cmd, "exec ", 5) == 0) {
+        shell_launch_elf(cmd + 5);
     }
     else if (strncmp(cmd, "write ", 6) == 0) {
         char* filename = cmd + 6;
@@ -307,7 +512,7 @@ void shell_execute(void) {
             }
             *data++ = '\0';
         }
-        fat16_write(filename, data);
+        vfs_write_text(filename, data);
     }
     else if (strcmp(cmd, "malloc") == 0) {
         extern uint32_t pmm_max_blocks;
@@ -356,6 +561,9 @@ void shell_execute(void) {
         kfree(str1);
         kfree(str2);
         printf("Heap blocks successfully cleaned up.\n");
+    }
+    else if (cmd[0] == '.' && cmd[1] == '/') {
+        shell_launch_elf(cmd);
     }
     else {
         terminal_setcolor(vga_entry_color(VGA_COLOR_RED, VGA_COLOR_BLACK));

@@ -13,6 +13,7 @@
 #define FAT16_LFN_ATTRIBUTE 0x0F
 #define FAT16_LFN_MAX_LENGTH 255
 #define FAT16_LFN_MAX_ENTRIES 20
+#define FAT16_MAX_DIRECTORY_DEPTH 16
 
 typedef struct __attribute__((packed)) {
     uint8_t order;
@@ -51,9 +52,27 @@ static uint32_t root_start_sector;
 static uint32_t data_start_sector;
 static uint32_t max_cluster;
 static int mounted;
+static uint16_t current_directory_depth;
+static uint16_t directory_cluster_stack[FAT16_MAX_DIRECTORY_DEPTH + 1];
+static uint16_t directory_path_lengths[FAT16_MAX_DIRECTORY_DEPTH + 1];
+static char current_directory_path[FAT16_LFN_MAX_LENGTH + 1] = "/";
 
 static int read_root_entry(uint32_t index, fat16_dir_entry_t* entry,
                            uint8_t* sector_buffer);
+static int directory_entry_at(uint16_t directory_cluster, uint32_t index,
+                              fat16_dir_entry_t* entry,
+                              uint8_t* sector_buffer);
+static int write_directory_entry(uint16_t directory_cluster, uint32_t index,
+                                 const void* entry,
+                                 uint8_t* sector_buffer);
+static int find_free_entries(uint16_t directory_cluster, uint32_t required,
+                             uint32_t* start_index,
+                             uint8_t* sector_buffer);
+static int write_long_name_entries(uint16_t directory_cluster,
+                                   const char* filename, size_t length,
+                                   uint32_t short_entry_index,
+                                   const fat16_dir_entry_t* short_entry,
+                                   uint8_t* sector_buffer);
 
 static char ascii_lower(char c) {
     if (c >= 'A' && c <= 'Z') {
@@ -156,6 +175,11 @@ static int try_mount(uint32_t start_lba, uint32_t sector_count,
     data_start_sector = (uint32_t)candidate_data_start;
     max_cluster = cluster_count + 1;
     mounted = 1;
+    current_directory_depth = 0;
+    directory_cluster_stack[0] = 0;
+    directory_path_lengths[0] = 1;
+    current_directory_path[0] = '/';
+    current_directory_path[1] = '\0';
     return 1;
 }
 
@@ -167,7 +191,7 @@ void fat16_init(void) {
     disk_sector_count = 0;
     volume_sector_count = 0;
     if (!ata_init(&sector_count)) {
-        printf("FAT16: ATA primary-master disk is unavailable or lacks LBA28.\n");
+        printf("FAT16: No supported AHCI or ATA PIO disk was found.\n");
         return;
     }
     disk_sector_count = sector_count;
@@ -191,8 +215,9 @@ void fat16_init(void) {
                 continue;
             }
             if (try_mount(start, size, sector)) {
-                printf("FAT16: Mounted partition %s on ATA primary master.\n",
-                       i == 0 ? "1" : i == 1 ? "2" : i == 2 ? "3" : "4");
+                printf("FAT16: Mounted partition %s using %s.\n",
+                       i == 0 ? "1" : i == 1 ? "2" : i == 2 ? "3" : "4",
+                       ata_backend_name());
                 return;
             }
         }
@@ -204,7 +229,8 @@ void fat16_init(void) {
         return;
     }
     if (try_mount(0, disk_sector_count, sector)) {
-        printf("FAT16: Mounted whole-disk FAT16 volume on ATA primary master.\n");
+        printf("FAT16: Mounted whole-disk FAT16 volume using %s.\n",
+               ata_backend_name());
         return;
     }
 
@@ -440,14 +466,18 @@ static char make_alias_character(char c) {
     return '_';
 }
 
-static int short_alias_exists(const char* name, const char* ext,
+static int short_alias_exists(uint16_t directory_cluster,
+                              const char* name, const char* ext,
                               uint8_t* sector_buffer) {
-    for (uint32_t i = 0; i < bpb.root_dir_entries; i++) {
+    for (uint32_t i = 0;; i++) {
         fat16_dir_entry_t entry;
-        if (!read_root_entry(i, &entry, sector_buffer)) {
+        int read_result =
+            directory_entry_at(directory_cluster, i, &entry, sector_buffer);
+        if (read_result < 0) {
+            printf("FAT16: Could not read the directory.\n");
             return -1;
         }
-        if (entry.name[0] == 0) {
+        if (!read_result || entry.name[0] == 0) {
             return 0;
         }
         if ((uint8_t)entry.name[0] == 0xE5 ||
@@ -462,7 +492,8 @@ static int short_alias_exists(const char* name, const char* ext,
     return 0;
 }
 
-static int make_short_alias(const char* filename, size_t length,
+static int make_short_alias(uint16_t directory_cluster, const char* filename,
+                            size_t length,
                             char* name, char* ext, int* needs_lfn,
                             uint8_t* sector_buffer) {
     if (make_fat_name(filename, name, ext)) {
@@ -520,7 +551,8 @@ static int make_short_alias(const char* filename, size_t length,
             name[prefix_length + 1 + i] = digits[digit_count - i - 1];
         }
 
-        int exists = short_alias_exists(name, ext, sector_buffer);
+        int exists = short_alias_exists(directory_cluster, name, ext,
+                                        sector_buffer);
         if (exists < 0) {
             return 0;
         }
@@ -581,6 +613,148 @@ static int write_fat_entry(uint16_t cluster, uint16_t value,
     return 1;
 }
 
+static int directory_entry_at(uint16_t directory_cluster, uint32_t index,
+                              fat16_dir_entry_t* entry,
+                              uint8_t* sector_buffer) {
+    if (!directory_cluster) {
+        if (index >= bpb.root_dir_entries) {
+            return 0;
+        }
+        return read_root_entry(index, entry, sector_buffer) ? 1 : -1;
+    }
+
+    uint32_t entries_per_cluster =
+        (uint32_t)bpb.sectors_per_cluster * ATA_SECTOR_SIZE /
+        sizeof(fat16_dir_entry_t);
+    uint32_t cluster_index = index / entries_per_cluster;
+    uint32_t entry_index = index % entries_per_cluster;
+    uint16_t cluster = directory_cluster;
+    for (uint32_t i = 0; i < cluster_index; i++) {
+        uint16_t next;
+        if (cluster < 2 || cluster > max_cluster ||
+            !read_fat_entry(cluster, &next, sector_buffer)) {
+            return -1;
+        }
+        if (next >= 0xFFF8) {
+            return 0;
+        }
+        if (next < 2 || next > max_cluster) {
+            return -1;
+        }
+        cluster = next;
+    }
+    if (cluster < 2 || cluster > max_cluster) {
+        return -1;
+    }
+
+    uint32_t sector = data_start_sector +
+        ((uint32_t)cluster - 2) * bpb.sectors_per_cluster +
+        (entry_index * sizeof(fat16_dir_entry_t)) / ATA_SECTOR_SIZE;
+    uint32_t offset =
+        (entry_index * sizeof(fat16_dir_entry_t)) % ATA_SECTOR_SIZE;
+    if (!volume_read_sector(sector, sector_buffer)) {
+        return -1;
+    }
+    memcpy(entry, sector_buffer + offset, sizeof(*entry));
+    return 1;
+}
+
+static int write_directory_entry(uint16_t directory_cluster, uint32_t index,
+                                 const void* entry,
+                                 uint8_t* sector_buffer) {
+    if (!directory_cluster) {
+        return write_root_entry(index, entry, sector_buffer);
+    }
+
+    uint32_t entries_per_cluster =
+        (uint32_t)bpb.sectors_per_cluster * ATA_SECTOR_SIZE /
+        sizeof(fat16_dir_entry_t);
+    uint32_t cluster_index = index / entries_per_cluster;
+    uint32_t entry_index = index % entries_per_cluster;
+    uint16_t cluster = directory_cluster;
+    for (uint32_t i = 0; i < cluster_index; i++) {
+        uint16_t next;
+        if (cluster < 2 || cluster > max_cluster ||
+            !read_fat_entry(cluster, &next, sector_buffer) ||
+            next < 2 || next > max_cluster) {
+            return 0;
+        }
+        cluster = next;
+    }
+    if (cluster < 2 || cluster > max_cluster) {
+        return 0;
+    }
+
+    uint32_t sector = data_start_sector +
+        ((uint32_t)cluster - 2) * bpb.sectors_per_cluster +
+        (entry_index * sizeof(fat16_dir_entry_t)) / ATA_SECTOR_SIZE;
+    uint32_t offset =
+        (entry_index * sizeof(fat16_dir_entry_t)) % ATA_SECTOR_SIZE;
+    if (!volume_read_sector(sector, sector_buffer)) {
+        return 0;
+    }
+    memcpy(sector_buffer + offset, entry, sizeof(fat16_dir_entry_t));
+    return volume_write_sector(sector, sector_buffer);
+}
+
+static int allocate_directory_cluster(uint16_t* allocated,
+                                      uint8_t* sector_buffer) {
+    for (uint32_t candidate = 2; candidate <= max_cluster; candidate++) {
+        uint16_t value;
+        if (!read_fat_entry((uint16_t)candidate, &value, sector_buffer)) {
+            return 0;
+        }
+        if (value) {
+            continue;
+        }
+        if (!write_fat_entry((uint16_t)candidate, 0xFFFF, sector_buffer)) {
+            return 0;
+        }
+
+        uint32_t first_sector = data_start_sector +
+            (candidate - 2) * bpb.sectors_per_cluster;
+        for (uint32_t i = 0; i < bpb.sectors_per_cluster; i++) {
+            memset(sector_buffer, 0, ATA_SECTOR_SIZE);
+            if (!volume_write_sector(first_sector + i, sector_buffer)) {
+                (void)write_fat_entry((uint16_t)candidate, 0, sector_buffer);
+                return 0;
+            }
+        }
+        *allocated = (uint16_t)candidate;
+        return 1;
+    }
+    return 0;
+}
+
+static int extend_directory(uint16_t directory_cluster,
+                            uint8_t* sector_buffer) {
+    uint16_t tail = directory_cluster;
+    uint32_t traversed = 0;
+    while (tail >= 2 && tail <= max_cluster &&
+           traversed++ < max_cluster - 1) {
+        uint16_t next;
+        if (!read_fat_entry(tail, &next, sector_buffer)) {
+            return 0;
+        }
+        if (next >= 0xFFF8) {
+            uint16_t added;
+            if (!allocate_directory_cluster(&added, sector_buffer)) {
+                return 0;
+            }
+            if (!write_fat_entry(tail, added, sector_buffer)) {
+                (void)write_fat_entry(added, 0, sector_buffer);
+                return 0;
+            }
+            return 1;
+        }
+        if (next < 2 || next > max_cluster) {
+            return 0;
+        }
+        tail = next;
+    }
+    return 0;
+}
+
 static int release_clusters(const uint16_t* clusters, uint32_t count,
                             uint8_t* sector_buffer) {
     int success = 1;
@@ -614,17 +788,20 @@ static int release_cluster_chain(uint16_t cluster, uint8_t* sector_buffer) {
     return cluster == 0;
 }
 
-static int find_file(const char* filename, fat16_dir_entry_t* found,
+static int find_file(uint16_t directory_cluster, const char* filename,
+                     fat16_dir_entry_t* found,
                      uint32_t* found_index, uint8_t* sector_buffer) {
     fat16_lfn_state_t lfn_state;
     reset_lfn_state(&lfn_state);
-    for (uint32_t i = 0; i < bpb.root_dir_entries; i++) {
+    for (uint32_t i = 0;; i++) {
         fat16_dir_entry_t entry;
-        if (!read_root_entry(i, &entry, sector_buffer)) {
-            printf("FAT16: Could not read the root directory.\n");
+        int read_result =
+            directory_entry_at(directory_cluster, i, &entry, sector_buffer);
+        if (read_result < 0) {
+            printf("FAT16: Could not read the directory.\n");
             return -1;
         }
-        if (entry.name[0] == 0) {
+        if (!read_result || entry.name[0] == 0) {
             return 0;
         }
         if ((uint8_t)entry.name[0] == 0xE5) {
@@ -657,42 +834,386 @@ static int find_file(const char* filename, fat16_dir_entry_t* found,
     return 0;
 }
 
-static int find_free_entries(uint32_t required, uint32_t* start_index,
-                             uint8_t* sector_buffer) {
-    uint32_t run_start = 0;
-    uint32_t run_length = 0;
-    for (uint32_t i = 0; i < bpb.root_dir_entries; i++) {
-        fat16_dir_entry_t entry;
-        if (!read_root_entry(i, &entry, sector_buffer)) {
-            return -1;
-        }
-        if (entry.name[0] == 0) {
-            if (!run_length) {
-                run_start = i;
-            }
-            run_length = bpb.root_dir_entries - run_start;
-            if (run_length >= required) {
-                *start_index = run_start;
-                return 1;
-            }
-            return 0;
-        }
-        if ((uint8_t)entry.name[0] == 0xE5) {
-            if (!run_length) {
-                run_start = i;
-            }
-            if (++run_length >= required) {
-                *start_index = run_start;
-                return 1;
-            }
-        } else {
-            run_length = 0;
-        }
+static int find_path_entry(const char* path, fat16_dir_entry_t* found,
+                           uint16_t* parent_cluster, uint32_t* found_index,
+                           uint8_t* sector_buffer) {
+    if (!path || !*path) {
+        return 0;
     }
-    return 0;
+
+    uint16_t directory_cluster =
+        path[0] == '/' ? 0
+                       : directory_cluster_stack[current_directory_depth];
+    const char* component = path;
+    while (*component == '/') {
+        component++;
+    }
+    if (!*component) {
+        return 0;
+    }
+
+    for (;;) {
+        char name[FAT16_LFN_MAX_LENGTH + 1];
+        size_t length = 0;
+        while (component[length] && component[length] != '/') {
+            if (length == FAT16_LFN_MAX_LENGTH) {
+                return 0;
+            }
+            name[length] = component[length];
+            length++;
+        }
+        name[length] = '\0';
+        component += length;
+        while (*component == '/') {
+            component++;
+        }
+        int has_next = *component != '\0';
+
+        if (length == 1 && name[0] == '.') {
+            if (!has_next) {
+                return 0;
+            }
+            continue;
+        }
+        if (length == 2 && name[0] == '.' && name[1] == '.') {
+            if (directory_cluster) {
+                fat16_dir_entry_t parent;
+                int result = find_file(directory_cluster, "..", &parent, 0,
+                                       sector_buffer);
+                if (result <= 0 || !(parent.attrib & 0x10)) {
+                    return result < 0 ? -1 : 0;
+                }
+                directory_cluster = parent.first_cluster_low;
+            }
+            if (!has_next) {
+                return 0;
+            }
+            continue;
+        }
+
+        uint32_t index;
+        int result = find_file(directory_cluster, name, found, &index,
+                               sector_buffer);
+        if (result <= 0) {
+            return result;
+        }
+        if (has_next) {
+            if (!(found->attrib & 0x10) ||
+                found->first_cluster_low < 2 ||
+                found->first_cluster_low > max_cluster) {
+                return 0;
+            }
+            directory_cluster = found->first_cluster_low;
+            continue;
+        }
+        if (parent_cluster) {
+            *parent_cluster = directory_cluster;
+        }
+        if (found_index) {
+            *found_index = index;
+        }
+        return 1;
+    }
 }
 
-static int write_long_name_entries(const char* filename, size_t length,
+static int resolve_parent_directory(const char* path,
+                                    uint16_t* parent_cluster,
+                                    const char** leaf,
+                                    char* parent_path,
+                                    size_t parent_path_capacity,
+                                    uint8_t* sector_buffer) {
+    if (!path || !*path || !parent_cluster || !leaf || !parent_path ||
+        !parent_path_capacity) {
+        return 0;
+    }
+
+    size_t path_length = strlen(path);
+    if (path_length > FAT16_LFN_MAX_LENGTH || path[path_length - 1] == '/') {
+        return 0;
+    }
+
+    const char* last_separator = 0;
+    for (const char* current = path; *current; current++) {
+        if (*current == '/') {
+            last_separator = current;
+        }
+    }
+    *leaf = last_separator ? last_separator + 1 : path;
+    if (!**leaf) {
+        return 0;
+    }
+
+    if (!last_separator) {
+        *parent_cluster =
+            directory_cluster_stack[current_directory_depth];
+        return 1;
+    }
+
+    size_t parent_length = (size_t)(last_separator - path);
+    if (!parent_length) {
+        *parent_cluster = 0;
+        return 1;
+    }
+    if (parent_length >= parent_path_capacity) {
+        return 0;
+    }
+    memcpy(parent_path, path, parent_length);
+    parent_path[parent_length] = '\0';
+
+    fat16_dir_entry_t parent;
+    int result = find_path_entry(parent_path, &parent, 0, 0, sector_buffer);
+    if (result <= 0 || !(parent.attrib & 0x10) ||
+        parent.first_cluster_low < 2 ||
+        parent.first_cluster_low > max_cluster) {
+        return 0;
+    }
+    *parent_cluster = parent.first_cluster_low;
+    return 1;
+}
+
+const char* fat16_get_cwd(void) {
+    return current_directory_path;
+}
+
+void fat16_cd(const char* path) {
+    uint8_t sector_buffer[ATA_SECTOR_SIZE];
+    uint16_t clusters[FAT16_MAX_DIRECTORY_DEPTH + 1];
+    uint16_t lengths[FAT16_MAX_DIRECTORY_DEPTH + 1];
+    char new_path[FAT16_LFN_MAX_LENGTH + 1];
+    if (!mounted) {
+        printf("FAT16 volume is not mounted.\n");
+        return;
+    }
+    if (!path || !*path || strlen(path) > FAT16_LFN_MAX_LENGTH) {
+        printf("Usage: cd <directory>\n");
+        return;
+    }
+
+    uint16_t depth = path[0] == '/' ? 0 : current_directory_depth;
+    for (uint16_t i = 0; i <= depth; i++) {
+        clusters[i] = path[0] == '/' ? 0 : directory_cluster_stack[i];
+        lengths[i] = path[0] == '/' ? 1 : directory_path_lengths[i];
+    }
+    memcpy(new_path, path[0] == '/' ? "/" : current_directory_path,
+           path[0] == '/' ? 2 : strlen(current_directory_path) + 1);
+
+    const char* component = path;
+    while (*component == '/') {
+        component++;
+    }
+    while (*component) {
+        char name[FAT16_LFN_MAX_LENGTH + 1];
+        size_t length = 0;
+        while (component[length] && component[length] != '/') {
+            if (length == FAT16_LFN_MAX_LENGTH) {
+                printf("FAT16: Directory name is too long.\n");
+                return;
+            }
+            name[length] = component[length];
+            length++;
+        }
+        name[length] = '\0';
+        component += length;
+        while (*component == '/') {
+            component++;
+        }
+
+        if (length == 1 && name[0] == '.') {
+            continue;
+        }
+        if (length == 2 && name[0] == '.' && name[1] == '.') {
+            if (depth) {
+                depth--;
+                new_path[lengths[depth]] = '\0';
+            }
+            continue;
+        }
+
+        if (depth == FAT16_MAX_DIRECTORY_DEPTH) {
+            printf("FAT16: Maximum directory depth reached.\n");
+            return;
+        }
+        fat16_dir_entry_t entry;
+        int result = find_file(clusters[depth], name, &entry, 0,
+                               sector_buffer);
+        if (result < 0) {
+            return;
+        }
+        if (!result || !(entry.attrib & 0x10) ||
+            entry.first_cluster_low < 2 ||
+            entry.first_cluster_low > max_cluster) {
+            printf("FAT16: Directory not found: %s\n", name);
+            return;
+        }
+
+        size_t path_length = strlen(new_path);
+        size_t separator = path_length > 1 ? 1 : 0;
+        if (path_length + separator + length > FAT16_LFN_MAX_LENGTH) {
+            printf("FAT16: Current path would be too long.\n");
+            return;
+        }
+        if (separator) {
+            new_path[path_length++] = '/';
+        }
+        memcpy(new_path + path_length, name, length + 1);
+        depth++;
+        clusters[depth] = entry.first_cluster_low;
+        lengths[depth] = (uint16_t)strlen(new_path);
+    }
+
+    current_directory_depth = depth;
+    for (uint16_t i = 0; i <= depth; i++) {
+        directory_cluster_stack[i] = clusters[i];
+        directory_path_lengths[i] = lengths[i];
+    }
+    memcpy(current_directory_path, new_path, strlen(new_path) + 1);
+}
+
+void fat16_mkdir(const char* name) {
+    uint8_t sector_buffer[ATA_SECTOR_SIZE];
+    fat16_dir_entry_t entry;
+    size_t name_length;
+    uint32_t free_start;
+    int needs_lfn;
+    const char* leaf;
+    char parent_path[FAT16_LFN_MAX_LENGTH + 1];
+    char short_name[8];
+    char extension[3];
+    if (!mounted) {
+        printf("FAT16 volume is not mounted.\n");
+        return;
+    }
+    uint16_t parent_cluster;
+    if (!resolve_parent_directory(name, &parent_cluster, &leaf, parent_path,
+                                  sizeof(parent_path), sector_buffer) ||
+        !valid_long_filename(leaf, &name_length)) {
+        printf("Usage: mkdir <directory name>\n");
+        return;
+    }
+    name = leaf;
+    int result = find_file(parent_cluster, name, &entry, 0, sector_buffer);
+    if (result < 0) {
+        return;
+    }
+    if (result) {
+        printf("FAT16: Entry already exists: %s\n", name);
+        return;
+    }
+    if (!make_short_alias(parent_cluster, name, name_length, short_name,
+                          extension, &needs_lfn, sector_buffer)) {
+        printf("FAT16: Could not create a unique short filename alias.\n");
+        return;
+    }
+    uint32_t lfn_count = needs_lfn
+        ? ((uint32_t)name_length + 12) / 13
+        : 0;
+    result = find_free_entries(parent_cluster, lfn_count + 1, &free_start,
+                               sector_buffer);
+    if (result <= 0) {
+        printf("FAT16: Could not find space for a directory entry.\n");
+        return;
+    }
+    uint16_t new_cluster;
+    if (!allocate_directory_cluster(&new_cluster, sector_buffer)) {
+        printf("FAT16: No free clusters for the new directory.\n");
+        return;
+    }
+
+    fat16_dir_entry_t dot;
+    memset(&dot, 0, sizeof(dot));
+    memcpy(dot.name, ".       ", 8);
+    memcpy(dot.ext, "   ", 3);
+    dot.attrib = 0x10;
+    dot.first_cluster_low = new_cluster;
+    fat16_dir_entry_t dotdot = dot;
+    memcpy(dotdot.name, "..      ", 8);
+    dotdot.first_cluster_low = parent_cluster;
+    if (!write_directory_entry(new_cluster, 0, &dot, sector_buffer) ||
+        !write_directory_entry(new_cluster, 1, &dotdot, sector_buffer)) {
+        (void)release_cluster_chain(new_cluster, sector_buffer);
+        printf("FAT16: Could not initialize the new directory.\n");
+        return;
+    }
+
+    memset(&entry, 0, sizeof(entry));
+    memcpy(entry.name, short_name, sizeof(short_name));
+    memcpy(entry.ext, extension, sizeof(extension));
+    entry.attrib = 0x10;
+    entry.first_cluster_low = new_cluster;
+    uint32_t short_entry_index = free_start + lfn_count;
+    if ((needs_lfn &&
+         !write_long_name_entries(parent_cluster, name, name_length,
+                                  short_entry_index, &entry, sector_buffer)) ||
+        !write_directory_entry(parent_cluster, short_entry_index, &entry,
+                               sector_buffer)) {
+        (void)release_cluster_chain(new_cluster, sector_buffer);
+        printf("FAT16: Could not add the directory entry.\n");
+        return;
+    }
+    printf("Directory created: %s\n", name);
+}
+
+static int find_free_entries(uint16_t directory_cluster, uint32_t required,
+                             uint32_t* start_index,
+                             uint8_t* sector_buffer) {
+    for (;;) {
+        uint32_t capacity = directory_cluster ? 0 : bpb.root_dir_entries;
+        if (directory_cluster) {
+            uint16_t cluster = directory_cluster;
+            uint32_t entries_per_cluster =
+                (uint32_t)bpb.sectors_per_cluster * ATA_SECTOR_SIZE /
+                sizeof(fat16_dir_entry_t);
+            uint32_t clusters = 0;
+            while (cluster >= 2 && cluster <= max_cluster &&
+                   clusters++ < max_cluster - 1) {
+                uint16_t next;
+                if (!read_fat_entry(cluster, &next, sector_buffer)) {
+                    return -1;
+                }
+                capacity += entries_per_cluster;
+                if (next >= 0xFFF8) {
+                    break;
+                }
+                if (next < 2 || next > max_cluster) {
+                    return -1;
+                }
+                cluster = next;
+            }
+        }
+
+        uint32_t run_start = 0;
+        uint32_t run_length = 0;
+        for (uint32_t i = 0; i < capacity; i++) {
+            fat16_dir_entry_t entry;
+            int read_result = directory_entry_at(
+                directory_cluster, i, &entry, sector_buffer);
+            if (read_result < 0) {
+                return -1;
+            }
+            if (!read_result || entry.name[0] == 0 ||
+                (uint8_t)entry.name[0] == 0xE5) {
+                if (!run_length) {
+                    run_start = i;
+                }
+                run_length++;
+                if (run_length >= required) {
+                    *start_index = run_start;
+                    return 1;
+                }
+            } else {
+                run_length = 0;
+            }
+        }
+
+        if (!directory_cluster || !extend_directory(directory_cluster,
+                                                    sector_buffer)) {
+            return 0;
+        }
+    }
+}
+
+static int write_long_name_entries(uint16_t directory_cluster,
+                                   const char* filename, size_t length,
                                    uint32_t short_entry_index,
                                    const fat16_dir_entry_t* short_entry,
                                    uint8_t* sector_buffer) {
@@ -709,8 +1230,9 @@ static int write_long_name_entries(const char* filename, size_t length,
         if (i == 0) {
             entry.order |= 0x40;
         }
-        if (!write_root_entry(short_entry_index - count + i, &entry,
-                              sector_buffer)) {
+        if (!write_directory_entry(directory_cluster,
+                                   short_entry_index - count + i, &entry,
+                                   sector_buffer)) {
             return 0;
         }
     }
@@ -725,6 +1247,8 @@ void fat16_touch(const char* filename) {
     uint32_t free_start;
     int needs_lfn;
     int result;
+    const char* leaf;
+    char parent_path[FAT16_LFN_MAX_LENGTH + 1];
     char name[8];
     char ext[3];
 
@@ -732,12 +1256,18 @@ void fat16_touch(const char* filename) {
         printf("FAT16 volume is not mounted.\n");
         return;
     }
-    if (!valid_long_filename(filename, &filename_length)) {
+    uint16_t directory_cluster;
+    if (!resolve_parent_directory(filename, &directory_cluster, &leaf,
+                                  parent_path, sizeof(parent_path),
+                                  sector_buffer) ||
+        !valid_long_filename(leaf, &filename_length)) {
         printf("Usage: touch <filename> (ASCII, up to 255 characters)\n");
         return;
     }
 
-    result = find_file(filename, &entry, &existing_index, sector_buffer);
+    filename = leaf;
+    result = find_file(directory_cluster, filename, &entry, &existing_index,
+                       sector_buffer);
     if (result < 0) {
         return;
     }
@@ -746,20 +1276,21 @@ void fat16_touch(const char* filename) {
         return;
     }
 
-    if (!make_short_alias(filename, filename_length, name, ext, &needs_lfn,
-                          sector_buffer)) {
+    if (!make_short_alias(directory_cluster, filename, filename_length,
+                          name, ext, &needs_lfn, sector_buffer)) {
         printf("FAT16: Could not create a unique short filename alias.\n");
         return;
     }
 
     uint32_t lfn_count = needs_lfn ? (filename_length + 12) / 13 : 0;
-    result = find_free_entries(lfn_count + 1, &free_start, sector_buffer);
+    result = find_free_entries(directory_cluster, lfn_count + 1, &free_start,
+                               sector_buffer);
     if (result < 0) {
-        printf("FAT16: Could not read the root directory.\n");
+        printf("FAT16: Could not inspect the current directory.\n");
         return;
     }
     if (!result) {
-        printf("FAT16: Not enough consecutive root directory entries.\n");
+        printf("FAT16: Not enough consecutive directory entries.\n");
         return;
     }
 
@@ -768,17 +1299,20 @@ void fat16_touch(const char* filename) {
     memcpy(entry.ext, ext, sizeof(ext));
     entry.attrib = 0x20;
     uint32_t short_entry_index = free_start + lfn_count;
-    if (!write_long_name_entries(filename, filename_length,
-                                 short_entry_index, &entry, sector_buffer) ||
-        !write_root_entry(short_entry_index, &entry, sector_buffer)) {
-        printf("FAT16: Could not write the new root directory entry.\n");
+    if ((needs_lfn &&
+         !write_long_name_entries(directory_cluster, filename,
+                                  filename_length, short_entry_index, &entry,
+                                  sector_buffer)) ||
+        !write_directory_entry(directory_cluster, short_entry_index, &entry,
+                               sector_buffer)) {
+        printf("FAT16: Could not write the new directory entry.\n");
         return;
     }
 
     printf("File %s created successfully.\n", filename);
 }
 
-void fat16_write(const char* filename, const char* data) {
+int fat16_write_file(const char* filename, const void* contents, size_t size) {
     uint8_t sector_buffer[ATA_SECTOR_SIZE];
     fat16_dir_entry_t entry;
     uint32_t filename_length;
@@ -788,43 +1322,53 @@ void fat16_write(const char* filename, const char* data) {
     int replacing;
     int needs_lfn = 0;
     int result;
+    const char* leaf;
+    char parent_path[FAT16_LFN_MAX_LENGTH + 1];
     char name[8];
     char ext[3];
 
     if (!mounted) {
-        printf("FAT16 volume is not mounted.\n");
-        return;
+        return 0;
     }
-    if (!data || !valid_long_filename(filename, &filename_length)) {
-        printf("Usage: write <filename> <data>\n");
-        return;
+    if ((!contents && size) || size > UINT32_MAX || !filename || !*filename) {
+        return 0;
     }
 
-    result = find_file(filename, &entry, &entry_index, sector_buffer);
+    uint16_t directory_cluster =
+        directory_cluster_stack[current_directory_depth];
+    result = find_path_entry(filename, &entry, &directory_cluster,
+                             &entry_index, sector_buffer);
     if (result < 0) {
-        return;
+        return 0;
     }
     replacing = result;
     if (replacing) {
         if (entry.attrib & 0x10) {
-            printf("FAT16: Cannot write to a directory.\n");
-            return;
+            return 0;
         }
     } else {
-        if (!make_short_alias(filename, filename_length, name, ext,
+        if (!resolve_parent_directory(filename, &directory_cluster, &leaf,
+                                      parent_path, sizeof(parent_path),
+                                      sector_buffer) ||
+            !valid_long_filename(leaf, &filename_length)) {
+            return 0;
+        }
+        filename = leaf;
+        result = find_file(directory_cluster, filename, &entry, &entry_index,
+                           sector_buffer);
+        if (result < 0 || result) {
+            return 0;
+        }
+        if (!make_short_alias(directory_cluster, filename, filename_length,
+                              name, ext,
                               &needs_lfn, sector_buffer)) {
-            printf("FAT16: Could not create a unique short filename alias.\n");
-            return;
+            return 0;
         }
         lfn_count = needs_lfn ? (filename_length + 12) / 13 : 0;
-        result = find_free_entries(lfn_count + 1, &free_start, sector_buffer);
-        if (result < 0) {
-            printf("FAT16: Could not read the root directory.\n");
-            return;
-        }
-        if (!result) {
-            printf("FAT16: Not enough consecutive root directory entries.\n");
-            return;
+        result = find_free_entries(directory_cluster, lfn_count + 1,
+                                   &free_start, sector_buffer);
+        if (result <= 0) {
+            return 0;
         }
         entry_index = free_start + lfn_count;
         memset(&entry, 0, sizeof(entry));
@@ -833,15 +1377,13 @@ void fat16_write(const char* filename, const char* data) {
         entry.attrib = 0x20;
     }
 
-    uint32_t data_length = strlen(data);
+    uint32_t data_length = (uint32_t)size;
     uint32_t cluster_size =
         (uint32_t)bpb.sectors_per_cluster * ATA_SECTOR_SIZE;
     uint32_t cluster_count =
         (data_length + (uint64_t)cluster_size - 1) / cluster_size;
-    if (data_length > UINT32_MAX ||
-        (uint64_t)cluster_count > max_cluster - 1) {
-        printf("FAT16: File is too large for this volume.\n");
-        return;
+    if ((uint64_t)cluster_count > max_cluster - 1) {
+        return 0;
     }
 
     uint16_t old_first_cluster = entry.first_cluster_low;
@@ -849,8 +1391,7 @@ void fat16_write(const char* filename, const char* data) {
     if (cluster_count) {
         new_clusters = (uint16_t*)kmalloc(cluster_count * sizeof(uint16_t));
         if (!new_clusters) {
-            printf("FAT16: Not enough memory to prepare the file write.\n");
-            return;
+            return 0;
         }
 
         uint32_t found_clusters = 0;
@@ -859,18 +1400,16 @@ void fat16_write(const char* filename, const char* data) {
              cluster++) {
             uint16_t value;
             if (!read_fat_entry((uint16_t)cluster, &value, sector_buffer)) {
-                printf("FAT16: Could not read the allocation table.\n");
                 kfree(new_clusters);
-                return;
+                return 0;
             }
             if (value == 0) {
                 new_clusters[found_clusters++] = (uint16_t)cluster;
             }
         }
         if (found_clusters != cluster_count) {
-            printf("FAT16: Not enough free space on the volume.\n");
             kfree(new_clusters);
-            return;
+            return 0;
         }
     }
 
@@ -881,13 +1420,10 @@ void fat16_write(const char* filename, const char* data) {
             : 0xFFFF;
         if (!write_fat_entry(new_clusters[written_clusters], next,
                              sector_buffer)) {
-            if (!release_clusters(new_clusters, written_clusters + 1,
-                                  sector_buffer)) {
-                printf("FAT16: Failed to roll back partial allocation.\n");
-            }
+            (void)release_clusters(new_clusters, written_clusters + 1,
+                                   sector_buffer);
             kfree(new_clusters);
-            printf("FAT16: Could not update the allocation tables.\n");
-            return;
+            return 0;
         }
     }
 
@@ -902,16 +1438,14 @@ void fat16_write(const char* filename, const char* data) {
                 ? ATA_SECTOR_SIZE
                 : remaining;
             if (sector_bytes) {
-                memcpy(sector_buffer, data + data_offset, sector_bytes);
+                memcpy(sector_buffer,
+                       (const uint8_t*)contents + data_offset, sector_bytes);
             }
             if (!volume_write_sector(first_sector + s, sector_buffer)) {
-                if (!release_clusters(new_clusters, cluster_count,
-                                      sector_buffer)) {
-                    printf("FAT16: Failed to roll back file allocation.\n");
-                }
+                (void)release_clusters(new_clusters, cluster_count,
+                                       sector_buffer);
                 kfree(new_clusters);
-                printf("FAT16: Could not write file data.\n");
-                return;
+                return 0;
             }
             data_offset += sector_bytes;
             remaining -= sector_bytes;
@@ -920,46 +1454,203 @@ void fat16_write(const char* filename, const char* data) {
 
     entry.first_cluster_low = cluster_count ? new_clusters[0] : 0;
     entry.file_size = data_length;
-    if ((!replacing &&
-         !write_long_name_entries(filename, filename_length, entry_index,
-                                  &entry, sector_buffer)) ||
-        !write_root_entry(entry_index, &entry, sector_buffer)) {
+    if ((!replacing && needs_lfn &&
+         !write_long_name_entries(directory_cluster, filename, filename_length,
+                                  entry_index, &entry, sector_buffer)) ||
+        !write_directory_entry(directory_cluster, entry_index, &entry,
+                               sector_buffer)) {
         if (!release_clusters(new_clusters, cluster_count, sector_buffer)) {
-            printf("FAT16: Failed to roll back file allocation.\n");
+            kfree(new_clusters);
+            return 0;
         }
         kfree(new_clusters);
-        printf("FAT16: Could not update the root directory.\n");
-        return;
+        return 0;
     }
 
     kfree(new_clusters);
     if (replacing && old_first_cluster >= 2 &&
         !release_cluster_chain(old_first_cluster, sector_buffer)) {
         printf("FAT16: File was written, but old clusters could not be freed.\n");
+        return 0;
+    }
+    return 1;
+}
+
+static int delete_directory_entries(uint16_t parent_cluster,
+                                    uint32_t short_entry_index,
+                                    uint8_t* sector_buffer) {
+    uint32_t index = short_entry_index;
+    for (uint32_t count = 0;
+         index && count < FAT16_LFN_MAX_ENTRIES;
+         count++) {
+        fat16_dir_entry_t entry;
+        int result = directory_entry_at(parent_cluster, index - 1, &entry,
+                                        sector_buffer);
+        if (result <= 0) {
+            return 0;
+        }
+        if (entry.attrib != FAT16_LFN_ATTRIBUTE) {
+            break;
+        }
+        entry.name[0] = (char)0xE5;
+        if (!write_directory_entry(parent_cluster, index - 1, &entry,
+                                   sector_buffer)) {
+            return 0;
+        }
+        index--;
+    }
+
+    fat16_dir_entry_t entry;
+    int result = directory_entry_at(parent_cluster, short_entry_index, &entry,
+                                    sector_buffer);
+    if (result != 1) {
+        return 0;
+    }
+    entry.name[0] = (char)0xE5;
+    return write_directory_entry(parent_cluster, short_entry_index, &entry,
+                                 sector_buffer);
+}
+
+int fat16_unlink(const char* path) {
+    uint8_t sector_buffer[ATA_SECTOR_SIZE];
+    fat16_dir_entry_t entry;
+    uint16_t parent_cluster;
+    uint32_t entry_index;
+
+    if (!mounted || !path || !*path) {
+        return 0;
+    }
+    int result = find_path_entry(path, &entry, &parent_cluster, &entry_index,
+                                sector_buffer);
+    if (result != 1 || (entry.attrib & (0x01 | 0x08 | 0x10))) {
+        return 0;
+    }
+    if (entry.first_cluster_low == 1 ||
+        entry.first_cluster_low > max_cluster) {
+        return 0;
+    }
+    if (!delete_directory_entries(parent_cluster, entry_index,
+                                  sector_buffer)) {
+        return 0;
+    }
+    return entry.first_cluster_low < 2 ||
+        release_cluster_chain(entry.first_cluster_low, sector_buffer);
+}
+
+int fat16_rmdir(const char* path) {
+    uint8_t sector_buffer[ATA_SECTOR_SIZE];
+    fat16_dir_entry_t entry;
+    uint16_t parent_cluster;
+    uint32_t entry_index;
+
+    if (!mounted || !path || !*path) {
+        return 0;
+    }
+    int result = find_path_entry(path, &entry, &parent_cluster, &entry_index,
+                                sector_buffer);
+    if (result != 1 || !(entry.attrib & 0x10) ||
+        entry.first_cluster_low < 2 ||
+        entry.first_cluster_low > max_cluster) {
+        return 0;
+    }
+    for (uint16_t depth = 0; depth <= current_directory_depth; depth++) {
+        if (directory_cluster_stack[depth] == entry.first_cluster_low) {
+            return 0;
+        }
+    }
+
+    int empty = 0;
+    uint16_t cluster = entry.first_cluster_low;
+    for (uint32_t traversed = 0; traversed < max_cluster - 1; traversed++) {
+        uint32_t first_sector = data_start_sector +
+            ((uint32_t)cluster - 2) * bpb.sectors_per_cluster;
+        for (uint32_t sector = 0; sector < bpb.sectors_per_cluster; sector++) {
+            if (!volume_read_sector(first_sector + sector, sector_buffer)) {
+                return 0;
+            }
+            fat16_dir_entry_t* entries =
+                (fat16_dir_entry_t*)sector_buffer;
+            for (uint32_t i = 0;
+                 i < ATA_SECTOR_SIZE / sizeof(fat16_dir_entry_t);
+                 i++) {
+                fat16_dir_entry_t* child = &entries[i];
+                if (child->name[0] == 0) {
+                    empty = 1;
+                    break;
+                }
+                if ((uint8_t)child->name[0] == 0xE5 ||
+                    child->attrib == FAT16_LFN_ATTRIBUTE ||
+                    (child->attrib & 0x08) ||
+                    (child->name[0] == '.' &&
+                     (child->name[1] == ' ' || child->name[1] == '.'))) {
+                    continue;
+                }
+                return 0;
+            }
+            if (empty) {
+                break;
+            }
+        }
+        if (empty) {
+            break;
+        }
+
+        uint16_t next;
+        if (!read_fat_entry(cluster, &next, sector_buffer)) {
+            return 0;
+        }
+        if (next >= 0xFFF8) {
+            empty = 1;
+            break;
+        }
+        if (next < 2 || next > max_cluster) {
+            return 0;
+        }
+        cluster = next;
+    }
+    if (!empty ||
+        !delete_directory_entries(parent_cluster, entry_index,
+                                  sector_buffer)) {
+        return 0;
+    }
+    return release_cluster_chain(entry.first_cluster_low, sector_buffer);
+}
+
+int fat16_is_mounted(void) {
+    return mounted;
+}
+
+void fat16_write(const char* filename, const char* data) {
+    if (!data || !fat16_write_file(filename, data, strlen(data))) {
+        printf("FAT16: Could not write file %s.\n", filename ? filename : "");
         return;
     }
     char size[16];
-    inttostr(data_length, size);
+    inttostr(strlen(data), size);
     printf("Wrote %s (%s bytes).\n", filename, size);
 }
 
 void fat16_ls(void) {
     uint8_t sector_buffer[ATA_SECTOR_SIZE];
     fat16_lfn_state_t lfn_state;
+    uint16_t directory_cluster =
+        directory_cluster_stack[current_directory_depth];
     reset_lfn_state(&lfn_state);
     if (!mounted) {
         printf("FAT16 volume is not mounted.\n");
         return;
     }
 
-    printf("Directory listing of FAT16 volume:\n");
-    for (uint32_t i = 0; i < bpb.root_dir_entries; i++) {
+    printf("Directory listing of %s:\n", current_directory_path);
+    for (uint32_t i = 0;; i++) {
         fat16_dir_entry_t entry;
-        if (!read_root_entry(i, &entry, sector_buffer)) {
-            printf("FAT16: Could not read the root directory.\n");
+        int read_result =
+            directory_entry_at(directory_cluster, i, &entry, sector_buffer);
+        if (read_result < 0) {
+            printf("FAT16: Could not read the directory.\n");
             return;
         }
-        if (entry.name[0] == 0) {
+        if (!read_result || entry.name[0] == 0) {
             break;
         }
         if ((uint8_t)entry.name[0] == 0xE5) {
@@ -971,6 +1662,11 @@ void fat16_ls(void) {
             continue;
         }
         if (entry.attrib & 0x08) {
+            reset_lfn_state(&lfn_state);
+            continue;
+        }
+        if (entry.name[0] == '.' &&
+            (entry.name[1] == ' ' || entry.name[1] == '.')) {
             reset_lfn_state(&lfn_state);
             continue;
         }
@@ -990,6 +1686,92 @@ void fat16_ls(void) {
     }
 }
 
+static int read_file_contents(const fat16_dir_entry_t* entry,
+                              uint8_t* destination, int print_contents,
+                              uint8_t* sector_buffer) {
+    uint16_t cluster = entry->first_cluster_low;
+    uint32_t bytes_left = entry->file_size;
+    uint32_t destination_offset = 0;
+    uint32_t cluster_limit = 0;
+    while (bytes_left) {
+        if (cluster < 2 || cluster > max_cluster ||
+            ++cluster_limit > max_cluster - 1) {
+            return 0;
+        }
+
+        uint32_t cluster_sector = data_start_sector +
+            ((uint32_t)cluster - 2) * bpb.sectors_per_cluster;
+        for (uint32_t i = 0;
+             i < bpb.sectors_per_cluster && bytes_left;
+             i++) {
+            if (!volume_read_sector(cluster_sector + i, sector_buffer)) {
+                return 0;
+            }
+            uint32_t chunk = bytes_left > ATA_SECTOR_SIZE
+                ? ATA_SECTOR_SIZE
+                : bytes_left;
+            if (print_contents) {
+                for (uint32_t j = 0; j < chunk; j++) {
+                    terminal_putchar((char)sector_buffer[j]);
+                }
+            } else {
+                memcpy(destination + destination_offset, sector_buffer,
+                       chunk);
+            }
+            destination_offset += chunk;
+            bytes_left -= chunk;
+        }
+
+        if (bytes_left) {
+            uint16_t next_cluster;
+            if (!read_fat_entry(cluster, &next_cluster, sector_buffer) ||
+                next_cluster >= 0xFFF0 || next_cluster < 2 ||
+                next_cluster > max_cluster) {
+                return 0;
+            }
+            cluster = next_cluster;
+        }
+    }
+    return 1;
+}
+
+int fat16_load_file(const char* path, void** contents, size_t* size) {
+    uint8_t sector_buffer[ATA_SECTOR_SIZE];
+    fat16_dir_entry_t entry;
+    if (contents) {
+        *contents = 0;
+    }
+    if (size) {
+        *size = 0;
+    }
+    if (!mounted) {
+        return 0;
+    }
+    if (!path || !*path || !contents || !size) {
+        return 0;
+    }
+
+    int result = find_path_entry(path, &entry, 0, 0, sector_buffer);
+    if (result < 0) {
+        return 0;
+    }
+    if (!result || (entry.attrib & 0x10)) {
+        return 0;
+    }
+
+    uint8_t* data = (uint8_t*)kmalloc(entry.file_size ? entry.file_size : 1);
+    if (!data) {
+        return 0;
+    }
+    if (!read_file_contents(&entry, data, 0, sector_buffer)) {
+        kfree(data);
+        return 0;
+    }
+    *contents = data;
+    *size = entry.file_size;
+    return 1;
+}
+
 void fat16_cat(const char* filename) {
     uint8_t sector_buffer[ATA_SECTOR_SIZE];
     fat16_dir_entry_t entry;
@@ -1002,7 +1784,7 @@ void fat16_cat(const char* filename) {
         return;
     }
 
-    int result = find_file(filename, &entry, 0, sector_buffer);
+    int result = find_path_entry(filename, &entry, 0, 0, sector_buffer);
     if (result < 0) {
         return;
     }
@@ -1010,48 +1792,9 @@ void fat16_cat(const char* filename) {
         printf("File not found: %s\n", filename);
         return;
     }
-
-    uint16_t cluster = entry.first_cluster_low;
-    uint32_t bytes_left = entry.file_size;
-    uint32_t cluster_limit = 0;
-    while (bytes_left) {
-        if (cluster < 2 || cluster > max_cluster ||
-            ++cluster_limit > max_cluster - 1) {
-            printf("\nFAT16: Invalid cluster chain in %s.\n", filename);
-            return;
-        }
-
-        uint32_t cluster_sector = data_start_sector +
-            ((uint32_t)cluster - 2) * bpb.sectors_per_cluster;
-        for (uint32_t i = 0;
-             i < bpb.sectors_per_cluster && bytes_left;
-             i++) {
-            if (!volume_read_sector(cluster_sector + i, sector_buffer)) {
-                printf("\nFAT16: Could not read file data.\n");
-                return;
-            }
-            uint32_t to_print = bytes_left > ATA_SECTOR_SIZE
-                ? ATA_SECTOR_SIZE
-                : bytes_left;
-            for (uint32_t j = 0; j < to_print; j++) {
-                terminal_putchar((char)sector_buffer[j]);
-            }
-            bytes_left -= to_print;
-        }
-
-        if (bytes_left) {
-            uint16_t next_cluster;
-            if (!read_fat_entry(cluster, &next_cluster, sector_buffer)) {
-                printf("\nFAT16: Could not read the allocation table.\n");
-                return;
-            }
-            if (next_cluster >= 0xFFF0 ||
-                next_cluster < 2 || next_cluster > max_cluster) {
-                printf("\nFAT16: Invalid cluster chain in %s.\n", filename);
-                return;
-            }
-            cluster = next_cluster;
-        }
+    if (!read_file_contents(&entry, 0, 1, sector_buffer)) {
+        printf("\nFAT16: Could not read file data or cluster chain.\n");
+        return;
     }
     printf("\n");
 }

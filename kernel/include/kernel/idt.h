@@ -25,7 +25,7 @@ struct registers {
     uint32_t ds;                                      // Селектор данных
     uint32_t edi, esi, ebp, esp, ebx, edx, ecx, eax;  // Pushed by pusha
     uint32_t int_no, err_code;                        // Номер прерывания и код ошибки
-    uint32_t eip, cs, eflags, useresp, ss;            // Pushed by CPU automatically
+    uint32_t eip, cs, eflags, useresp, ss;            // ESP/SS are present on ring transitions
 };
 typedef struct registers regs_t;
 

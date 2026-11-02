@@ -6,6 +6,7 @@
 #include <kernel/heap.h>
 #include "vga.h"
 #include <kernel/mutex.h>
+#include <kernel/serial.h>
 
 // Мьютекс для защиты физического экрана VGA и каретки TTY
 mutex_t tty_mutex; 
@@ -33,6 +34,8 @@ void tty_create_vterms(void) {
         vterms[i]->history_position = 0;
         vterms[i]->history_draft = 0;
         vterms[i]->history_draft_length = 0;
+        vterms[i]->command_pending = 0;
+        vterms[i]->command_active = 0;
         for (size_t j = 0; j < TTY_COMMAND_HISTORY_SIZE; j++) {
             vterms[i]->command_history[j] = 0;
         }
@@ -123,6 +126,7 @@ void terminal_setcolor(uint8_t color) {
 }
 
 void terminal_putchar(char c) {
+    serial_write_char(c);
     mutex_lock(&tty_mutex); // Защищаем вывод мьютексом от Race Condition!
 
     virtual_tty_t* tty = vterms[active_vterm];

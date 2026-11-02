@@ -23,6 +23,8 @@ typedef struct {
     size_t history_position;
     char* history_draft;
     size_t history_draft_length;
+    volatile uint8_t command_pending;
+    volatile uint8_t command_active;
 } virtual_tty_t;
 
 

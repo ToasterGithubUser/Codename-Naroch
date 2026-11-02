@@ -1,4 +1,8 @@
 .section .text
+.equ SYSCALL_WRITE, 1
+.equ SYSCALL_EXIT, 2
+.equ SYSCALL_STDOUT, 1
+
 .global idt_load
 .global _idt_load
 .extern idt_ptr
@@ -58,6 +62,8 @@ ISR_NOERRCODE 0   # Для деления на ноль (isr0)
 
 ISR_NOERRCODE 32  #IRQ0 - sys timer
 ISR_NOERRCODE 33  # Для клавиатуры (isr33)
+ISR_NOERRCODE 128 # User syscall interrupt
+ISR_NOERRCODE 129 # Scheduler yield
 
 # --- ОБЩИЙ СТАБ ---
 
@@ -80,20 +86,37 @@ irq_common_stub:
     call irq_handler
     add $4, %esp    # Счищаем аргумент
 
-    # Переключаем контекст только после IRQ0 и только после инициализации планировщика.
     .extern current_task
     .extern task_switch
 
     cmpl $32, 36(%esp)
-    jne 1f
+    je 2f
+    cmpl $128, 36(%esp)
+    je 2f
+    cmpl $129, 36(%esp)
+    je 2f
+    cmpl $32, 36(%esp)
+    jae 1f
+    testb $3, 48(%esp)
+    jz 1f
+2:
     movl current_task, %eax
     testl %eax, %eax
     jz 1f
     call task_switch
     movl current_task, %eax
+    testl %eax, %eax
+    jz 3f
     movl 4(%eax), %esp  # Принудительно подменяем стек процессора на стек новой задачи!
+    jmp irq_restore_context
 
+3:
+    cli
+4:
+    hlt
+    jmp 4b
 1:
+irq_restore_context:
     pop %eax        # Восстанавливаем оригинальные сегменты данных новой задачи
     mov %ax, %ds
     mov %ax, %es
@@ -103,34 +126,135 @@ irq_common_stub:
     popa            # Восстанавливаем регистры общего назначения новой задачи
     add $8, %esp    # Очищаем фиктивные числа прерывания
     iret            # ВЗЛЕТАЕМ в контекст выполнения новой задачи!
-.global switch_to_user
-switch_to_user:
-    cli                     # Отключаем прерывания на момент ручной сборки стека
-    
-    # Селектор User Data равен 0x23 (0x20 смещение + 3 RPL)
-    mov $0x23, %ax
-    mov %ax, %ds
-    mov %ax, %es
-    mov %ax, %fs
-    mov %ax, %gs
 
-    # Подготавливаем стек для инструкции iret x86
-    pushl $0x23             # 1. SS (User Stack Segment)
-    pushl %esp              # 2. ESP (Текущий указатель стека, переиспользуем его для Ring 3)
-    pushfl                  # 3. EFLAGS
-    
-    # Разрешаем прерывания внутри EFLAGS, которые восстановятся после iret
-    popl %eax
-    orl $0x200, %eax
-    pushl %eax
-    
-    pushl $0x1B             # 4. CS (User Code Segment: 0x18 смещение + 3 RPL)
-    
-    # 5. EIP (Адрес функции, которую мы хотим запустить в User Mode)
-    # Аргумент entry_point передается в функцию по стандарту C через стек [esp + 20]
-    # (учитывая, что мы только что сделали 5 push-инструкций)
-    movl 20(%esp), %eax
-    pushl %eax
+.global task_start_asm
+task_start_asm:
+    call task_switch
+    movl current_task, %eax
+    movl 4(%eax), %esp
+    jmp irq_restore_context
 
-    # Выполняем аппаратный сброс кольца защиты!
-    iret
+.section .usertext,"ax"
+.global user_mode_demo_start
+.global user_mode_demo_end
+.global user_probe_fault
+.global user_probe_resume
+user_mode_demo_start:
+    movl $1, 0x40002000
+user_probe_fault:
+    movl 0x00100000, %eax
+    movl $3, 0x40002000
+    jmp 2f
+user_probe_resume:
+    nop
+2:
+    cmpl $2, 0x40002000
+    jne 3f
+    call 4f
+4:
+    popl %ecx
+    addl $(user_probe_pass_message - 4b), %ecx
+    movl $(user_probe_pass_message_end - user_probe_pass_message), %edx
+    jmp 5f
+3:
+    call 6f
+6:
+    popl %ecx
+    addl $(user_probe_fail_message - 6b), %ecx
+    movl $(user_probe_fail_message_end - user_probe_fail_message), %edx
+5:
+    movl $SYSCALL_STDOUT, %ebx
+    movl $1, %eax
+    int $0x80
+
+    movl $SYSCALL_WRITE, %eax
+    movl $SYSCALL_STDOUT, %ebx
+    movl $0x40004000, %ecx
+    movl $1, %edx
+    int $0x80
+    cmpl $-1, %eax
+    jne 7f
+    call 8f
+8:
+    popl %ecx
+    addl $(user_pointer_pass_message - 8b), %ecx
+    movl $(user_pointer_pass_message_end - user_pointer_pass_message), %edx
+    jmp 9f
+7:
+    call 10f
+10:
+    popl %ecx
+    addl $(user_pointer_fail_message - 10b), %ecx
+    movl $(user_pointer_fail_message_end - user_pointer_fail_message), %edx
+9:
+    movl $SYSCALL_STDOUT, %ebx
+    movl $1, %eax
+    int $0x80
+
+    movl $0xFFFFFFFF, %eax
+    int $0x80
+    cmpl $-1, %eax
+    jne 11f
+    call 12f
+12:
+    popl %ecx
+    addl $(user_number_pass_message - 12b), %ecx
+    movl $(user_number_pass_message_end - user_number_pass_message), %edx
+    jmp 13f
+11:
+    call 14f
+14:
+    popl %ecx
+    addl $(user_number_fail_message - 14b), %ecx
+    movl $(user_number_fail_message_end - user_number_fail_message), %edx
+13:
+    movl $SYSCALL_STDOUT, %ebx
+    movl $1, %eax
+    int $0x80
+
+    cmpl $1, 0x40002004
+    jne 11f
+    ud2
+11:
+    call 15f
+15:
+    popl %ecx
+    addl $(user_survivor_message - 15b), %ecx
+    movl $(user_survivor_message_end - user_survivor_message), %edx
+    movl $SYSCALL_STDOUT, %ebx
+    movl $SYSCALL_WRITE, %eax
+    int $0x80
+
+    movl $0x02000000, %ecx
+16:
+    decl %ecx
+    jnz 16b
+
+    movl $SYSCALL_EXIT, %eax
+    int $0x80
+    ud2
+
+user_probe_pass_message:
+    .ascii "PASS: ring 3 cannot read kernel memory.\n"
+user_probe_pass_message_end:
+user_probe_fail_message:
+    .ascii "FAIL: ring 3 read kernel memory.\n"
+user_probe_fail_message_end:
+user_pointer_pass_message:
+    .ascii "PASS: syscall rejected invalid user pointer.\n"
+user_pointer_pass_message_end:
+user_pointer_fail_message:
+    .ascii "FAIL: syscall accepted invalid user pointer.\n"
+user_pointer_fail_message_end:
+user_number_pass_message:
+    .ascii "PASS: syscall rejected unknown number.\n"
+user_number_pass_message_end:
+user_number_fail_message:
+    .ascii "FAIL: syscall accepted unknown number.\n"
+user_number_fail_message_end:
+user_survivor_message:
+    .ascii "PASS: process 2 survived process 1 fault.\n"
+user_survivor_message_end:
+user_mode_demo_end:
+
+.section .text

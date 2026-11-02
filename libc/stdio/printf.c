@@ -2,16 +2,44 @@
 #include <stdbool.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <string.h>
-#include <kernel/mutex.h>
 
-// Мьютекс для защиты физического экрана VGA и каретки TTY
-extern mutex_t tty_mutex; 
 static bool print(const char* data, size_t length) {
 	const unsigned char* bytes = (const unsigned char*) data;
 	for (size_t i = 0; i < length; i++)
 		if (putchar(bytes[i]) == EOF)
 			return false;
+	return true;
+}
+
+static bool print_integer(unsigned int value, unsigned int base, int uppercase,
+                          int negative, int pointer, int* written) {
+	char digits[sizeof(value) * 8];
+	size_t length = 0;
+	do {
+		unsigned int digit = value % base;
+		digits[length++] = (char)(digit < 10
+			? '0' + digit
+			: (uppercase ? 'A' : 'a') + digit - 10);
+		value /= base;
+	} while (value);
+
+	if (negative) {
+		if (putchar('-') == EOF)
+			return false;
+		(*written)++;
+	}
+	if (pointer) {
+		if (!print("0x", 2))
+			return false;
+		*written += 2;
+	}
+	while (length) {
+		if (putchar(digits[--length]) == EOF)
+			return false;
+		(*written)++;
+	}
 	return true;
 }
 
@@ -56,6 +84,8 @@ int printf(const char* restrict format, ...) {
 		} else if (*format == 's') {
 			format++;
 			const char* str = va_arg(parameters, const char*);
+			if (!str)
+				str = "(null)";
 			size_t len = strlen(str);
 			if (maxrem < len) {
 				// TODO: Set errno to EOVERFLOW.
@@ -64,6 +94,24 @@ int printf(const char* restrict format, ...) {
 			if (!print(str, len))
 				return -1;
 			written += len;
+		} else if (*format == 'd' || *format == 'i') {
+			format++;
+			int value = va_arg(parameters, int);
+			unsigned int magnitude = value < 0
+				? 0U - (unsigned int)value
+				: (unsigned int)value;
+			if (!print_integer(magnitude, 10, 0, value < 0, 0, &written))
+				return -1;
+		} else if (*format == 'u' || *format == 'x' ||
+		           *format == 'X' || *format == 'p') {
+			char conversion = *format++;
+			unsigned int value = conversion == 'p'
+				? (unsigned int)(uintptr_t)va_arg(parameters, void*)
+				: va_arg(parameters, unsigned int);
+			unsigned int base = conversion == 'u' ? 10 : 16;
+			if (!print_integer(value, base, conversion == 'X', 0,
+			                   conversion == 'p', &written))
+				return -1;
 		} else {
 			format = format_begun_at;
 			size_t len = strlen(format);
