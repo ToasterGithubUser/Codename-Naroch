@@ -14,6 +14,13 @@
 #define FAT16_LFN_MAX_LENGTH 255
 #define FAT16_LFN_MAX_ENTRIES 20
 #define FAT16_MAX_DIRECTORY_DEPTH 16
+#define FAT16_FORMAT_RESERVED_SECTORS 1
+#define FAT16_FORMAT_FAT_COUNT 2
+#define FAT16_FORMAT_ROOT_ENTRIES 512
+#define FAT16_FORMAT_ROOT_SECTORS \
+    (FAT16_FORMAT_ROOT_ENTRIES * sizeof(fat16_dir_entry_t) / ATA_SECTOR_SIZE)
+#define FAT16_MIN_CLUSTERS 4085
+#define FAT16_MAX_CLUSTERS 65524
 
 typedef struct __attribute__((packed)) {
     uint8_t order;
@@ -235,6 +242,188 @@ void fat16_init(void) {
     }
 
     printf("FAT16: No valid FAT16 primary partition found.\n");
+}
+
+static int fat16_format_layout(uint32_t available_sectors,
+                               uint32_t* volume_sectors,
+                               uint8_t* sectors_per_cluster,
+                               uint16_t* sectors_per_fat) {
+    uint32_t max_fat_sectors =
+        ((FAT16_MAX_CLUSTERS + 2) * sizeof(uint16_t) +
+         ATA_SECTOR_SIZE - 1) / ATA_SECTOR_SIZE;
+    for (uint32_t cluster_sectors = 1; cluster_sectors <= 64;
+         cluster_sectors *= 2) {
+        uint64_t max_volume =
+            (uint64_t)FAT16_MAX_CLUSTERS * cluster_sectors +
+            FAT16_FORMAT_RESERVED_SECTORS +
+            FAT16_FORMAT_FAT_COUNT * max_fat_sectors +
+            FAT16_FORMAT_ROOT_SECTORS;
+        if (available_sectors > max_volume && cluster_sectors < 64) {
+            continue;
+        }
+
+        uint32_t total = available_sectors < max_volume
+            ? available_sectors : (uint32_t)max_volume;
+        uint32_t fat_sectors = 1;
+        uint32_t clusters = 0;
+        for (uint32_t pass = 0; pass < 8; pass++) {
+            uint32_t overhead = FAT16_FORMAT_RESERVED_SECTORS +
+                FAT16_FORMAT_FAT_COUNT * fat_sectors +
+                FAT16_FORMAT_ROOT_SECTORS;
+            if (total <= overhead) {
+                break;
+            }
+            clusters = (total - overhead) / cluster_sectors;
+            uint32_t required_fat_sectors =
+                ((clusters + 2) * sizeof(uint16_t) +
+                 ATA_SECTOR_SIZE - 1) / ATA_SECTOR_SIZE;
+            if (required_fat_sectors == fat_sectors) {
+                break;
+            }
+            fat_sectors = required_fat_sectors;
+        }
+
+        uint32_t overhead = FAT16_FORMAT_RESERVED_SECTORS +
+            FAT16_FORMAT_FAT_COUNT * fat_sectors +
+            FAT16_FORMAT_ROOT_SECTORS;
+        clusters = total > overhead
+            ? (total - overhead) / cluster_sectors : 0;
+        if (clusters >= FAT16_MIN_CLUSTERS &&
+            clusters <= FAT16_MAX_CLUSTERS &&
+            fat_sectors <= UINT16_MAX) {
+            *volume_sectors = total;
+            *sectors_per_cluster = (uint8_t)cluster_sectors;
+            *sectors_per_fat = (uint16_t)fat_sectors;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int fat16_format(void) {
+    if (!disk_sector_count) {
+        printf("FAT16: Cannot format because no disk is available.\n");
+        return 0;
+    }
+
+    int create_partition = !mounted;
+    uint32_t start = mounted ? partition_start_lba : 2048;
+    uint32_t available = mounted
+        ? volume_sector_count
+        : disk_sector_count > start ? disk_sector_count - start : 0;
+    if (!available || start >= disk_sector_count ||
+        available > disk_sector_count - start) {
+        printf("FAT16: Disk is too small for a FAT16 volume.\n");
+        return 0;
+    }
+
+    uint32_t total_sectors;
+    uint8_t cluster_sectors;
+    uint16_t fat_sectors;
+    if (!fat16_format_layout(available, &total_sectors, &cluster_sectors,
+                             &fat_sectors)) {
+        printf("FAT16: Disk is too small for a valid FAT16 volume.\n");
+        return 0;
+    }
+
+    fat16_bpb_t new_bpb;
+    memset(&new_bpb, 0, sizeof(new_bpb));
+    new_bpb.jmp[0] = 0xEB;
+    new_bpb.jmp[1] = 0x3C;
+    new_bpb.jmp[2] = 0x90;
+    memcpy(new_bpb.oem_name, "NAROCH  ", sizeof(new_bpb.oem_name));
+    new_bpb.bytes_per_sector = ATA_SECTOR_SIZE;
+    new_bpb.sectors_per_cluster = cluster_sectors;
+    new_bpb.reserved_sectors = FAT16_FORMAT_RESERVED_SECTORS;
+    new_bpb.num_fats = FAT16_FORMAT_FAT_COUNT;
+    new_bpb.root_dir_entries = FAT16_FORMAT_ROOT_ENTRIES;
+    if (total_sectors <= UINT16_MAX) {
+        new_bpb.total_sectors_short = (uint16_t)total_sectors;
+    } else {
+        new_bpb.total_sectors_large = total_sectors;
+    }
+    new_bpb.media_type = 0xF8;
+    new_bpb.sectors_per_fat = fat_sectors;
+    new_bpb.sectors_per_track = 63;
+    new_bpb.num_heads = 255;
+    new_bpb.hidden_sectors = start;
+    new_bpb.drive_number = 0x80;
+    new_bpb.boot_signature = 0x29;
+    new_bpb.volume_id = 0x4E41524F;
+    memcpy(new_bpb.volume_label, "NAROCH     ",
+           sizeof(new_bpb.volume_label));
+    memcpy(new_bpb.fs_type, "FAT16   ", sizeof(new_bpb.fs_type));
+
+    mounted = 0;
+    uint8_t sector[ATA_SECTOR_SIZE];
+    for (uint32_t fat = 0; fat < FAT16_FORMAT_FAT_COUNT; fat++) {
+        for (uint32_t index = 0; index < fat_sectors; index++) {
+            memset(sector, 0, sizeof(sector));
+            if (!index) {
+                sector[0] = new_bpb.media_type;
+                sector[1] = 0xFF;
+                sector[2] = 0xFF;
+                sector[3] = 0xFF;
+            }
+            uint32_t lba = start + FAT16_FORMAT_RESERVED_SECTORS +
+                fat * fat_sectors + index;
+            if (!ata_write_sector(lba, sector)) {
+                printf("FAT16: Failed to initialize FAT at sector %u.\n",
+                       lba);
+                return 0;
+            }
+        }
+    }
+
+    uint32_t root_start = start + FAT16_FORMAT_RESERVED_SECTORS +
+        FAT16_FORMAT_FAT_COUNT * fat_sectors;
+    for (uint32_t index = 0; index < FAT16_FORMAT_ROOT_SECTORS; index++) {
+        memset(sector, 0, sizeof(sector));
+        if (!ata_write_sector(root_start + index, sector)) {
+            printf("FAT16: Failed to clear root directory at sector %u.\n",
+                   root_start + index);
+            return 0;
+        }
+    }
+
+    memset(sector, 0, sizeof(sector));
+    memcpy(sector, &new_bpb, sizeof(new_bpb));
+    uint16_t boot_signature = 0xAA55;
+    memcpy(sector + 510, &boot_signature, sizeof(boot_signature));
+    if (!ata_write_sector(start, sector)) {
+        printf("FAT16: Failed to write the volume boot sector.\n");
+        return 0;
+    }
+
+    if (create_partition) {
+        memset(sector, 0, sizeof(sector));
+        partition_entry_t* entry = (partition_entry_t*)(sector + 446);
+        entry->partition_type = total_sectors <= UINT16_MAX
+            ? FAT16_PARTITION_TYPE_CHS : FAT16_PARTITION_TYPE_LBA;
+        memset(entry->start_chs, 0xFF, sizeof(entry->start_chs));
+        memset(entry->end_chs, 0xFF, sizeof(entry->end_chs));
+        entry->start_chs[0] = 0xFE;
+        entry->end_chs[0] = 0xFE;
+        entry->start_lba = start;
+        entry->sector_count = total_sectors;
+        memcpy(sector + 510, &boot_signature, sizeof(boot_signature));
+        if (!ata_write_sector(0, sector)) {
+            printf("FAT16: Failed to write the partition table.\n");
+            return 0;
+        }
+        if (!ata_read_sector(start, sector)) {
+            printf("FAT16: Could not reread the formatted boot sector.\n");
+            return 0;
+        }
+    }
+
+    if (!try_mount(start, total_sectors, sector)) {
+        printf("FAT16: The formatted volume could not be mounted.\n");
+        return 0;
+    }
+    printf("FAT16: Formatted %u sectors using %s.\n", total_sectors,
+           ata_backend_name());
+    return 1;
 }
 
 static void format_name(const fat16_dir_entry_t* entry, char* out) {

@@ -1,5 +1,6 @@
 #include <kernel/ata.h>
 #include <kernel/io.h>
+#include <kernel/pci.h>
 #include <kernel/paging.h>
 #include <kernel/pmm.h>
 #include <string.h>
@@ -21,8 +22,6 @@
 #define ATA_STATUS_BSY  0x80
 #define ATA_WAIT_LIMIT  1000000
 
-#define PCI_CONFIG_ADDRESS 0x0CF8
-#define PCI_CONFIG_DATA 0x0CFC
 #define AHCI_MMIO_VIRTUAL_BASE 0x3F000000U
 #define AHCI_MMIO_MAP_SIZE 0x2000U
 #define AHCI_PORT_COUNT 32
@@ -69,66 +68,26 @@ typedef struct __attribute__((packed)) {
     ahci_prdt_entry_t prdt;
 } ahci_command_table_t;
 
-static uint32_t pci_read_config(uint8_t bus, uint8_t device,
-                                uint8_t function, uint8_t offset) {
-    uint32_t address = 0x80000000U |
-        ((uint32_t)bus << 16) | ((uint32_t)device << 11) |
-        ((uint32_t)function << 8) | (offset & 0xFC);
-    outl(PCI_CONFIG_ADDRESS, address);
-    return inl(PCI_CONFIG_DATA);
-}
-
-static void pci_write_config_word(uint8_t bus, uint8_t device,
-                                  uint8_t function, uint8_t offset,
-                                  uint16_t value) {
-    uint32_t address = 0x80000000U |
-        ((uint32_t)bus << 16) | ((uint32_t)device << 11) |
-        ((uint32_t)function << 8) | (offset & 0xFC);
-    outl(PCI_CONFIG_ADDRESS, address);
-    outw((uint16_t)(PCI_CONFIG_DATA + (offset & 2)), value);
-}
-
 static int ahci_find_controller(uint32_t* abar) {
-    for (uint32_t bus = 0; bus < 256; bus++) {
-        for (uint32_t device = 0; device < 32; device++) {
-            uint32_t identity = pci_read_config(
-                (uint8_t)bus, (uint8_t)device, 0, 0);
-            if ((identity & 0xFFFF) == 0xFFFF) {
-                continue;
-            }
-
-            uint32_t header =
-                pci_read_config((uint8_t)bus, (uint8_t)device, 0, 0x0C);
-            uint32_t function_count = (header & 0x00800000U) ? 8 : 1;
-            for (uint32_t function = 0; function < function_count;
-                 function++) {
-                uint32_t function_id = pci_read_config(
-                    (uint8_t)bus, (uint8_t)device, (uint8_t)function, 0);
-                if ((function_id & 0xFFFF) == 0xFFFF) {
-                    continue;
-                }
-                uint32_t class_code = pci_read_config(
-                    (uint8_t)bus, (uint8_t)device, (uint8_t)function, 0x08);
-                if ((class_code >> 8 & 0xFFFFFF) != 0x010601) {
-                    continue;
-                }
-
-                uint32_t bar =
-                    pci_read_config((uint8_t)bus, (uint8_t)device,
-                                    (uint8_t)function, 0x24);
-                if ((bar & 1) || (bar & 6) == 4 ||
-                    !(bar & 0xFFFFFFF0)) {
-                    continue;
-                }
-                uint32_t command = pci_read_config(
-                    (uint8_t)bus, (uint8_t)device, (uint8_t)function, 0x04);
-                pci_write_config_word(
-                    (uint8_t)bus, (uint8_t)device, (uint8_t)function, 0x04,
-                    (uint16_t)((command & 0xFFFF) | 0x0006));
-                *abar = bar & 0xFFFFFFF0;
-                return 1;
-            }
+    for (uint32_t i = 0; i < pci_device_count(); i++) {
+        const pci_device_t* device = pci_device_at(i);
+        if (!device || device->class_code != 0x01 ||
+            device->subclass != 0x06 || device->prog_if != 0x01) {
+            continue;
         }
+
+        uint32_t bar = pci_read_config32(
+            device->bus, device->device, device->function, 0x24);
+        if ((bar & 1) || (bar & 6) == 4 || !(bar & 0xFFFFFFF0)) {
+            continue;
+        }
+        uint32_t command = pci_read_config32(
+            device->bus, device->device, device->function, 0x04);
+        pci_write_config16(
+            device->bus, device->device, device->function, 0x04,
+            (uint16_t)((command & 0xFFFF) | 0x0006));
+        *abar = bar & 0xFFFFFFF0;
+        return 1;
     }
     return 0;
 }

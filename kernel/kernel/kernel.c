@@ -17,6 +17,10 @@
 #include <kernel/rtc.h>
 #include <kernel/syscall.h>
 #include <kernel/vfs.h>
+#include <kernel/pci.h>
+#include <kernel/net.h>
+#include <kernel/ps2_mouse.h>
+#include <kernel/video.h>
 #include <string.h>
 // Объявляем возможные альтернативные имена, которые генерируют разные версии linker.ld
 extern char _kernel_start    __attribute__((weak));
@@ -34,6 +38,8 @@ static void idle_task(void) {
     shell_prompt();
     for (;;) {
         shell_process_pending();
+        net_poll();
+        ps2_mouse_poll();
         uint8_t character;
         while (serial_read_char(&character)) {
             if (character == '\r') {
@@ -133,8 +139,12 @@ void kernel_main(uint32_t magic, multiboot_info_t* mboot_ptr) {
     //task_create(dummy_task_A);
     //task_create(dummy_task_B);
     // 3. ИНИЦИАЛИЗИРУЕМ ТЕРМИНАЛ VGA (он безопасно заберет выровненную память)
+    video_init(mboot_ptr);
     terminal_initialize();
     serial_init();
+    pci_init();
+    net_init();
+    ps2_mouse_init();
     fat16_init();
     vfs_init();
     // Вывод логов

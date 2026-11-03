@@ -50,6 +50,7 @@ typedef struct fat16_dir_entry fat16_dir_entry_t;
 
 // Mount a FAT16 partition from the primary-master ATA disk.
 void fat16_init(void);
+int fat16_format(void);
 void fat16_ls(void);
 void fat16_cd(const char* path);
 void fat16_mkdir(const char* name);

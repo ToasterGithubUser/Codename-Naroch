@@ -1,7 +1,7 @@
 #ifndef _KERNEL_TTY_H
 #define _KERNEL_TTY_H
-#define VGA_WIDTH 80
-#define VGA_HEIGHT 25
+#define TTY_DEFAULT_WIDTH 80
+#define TTY_DEFAULT_HEIGHT 25
 #define TTY_COMMAND_HISTORY_SIZE 8
 #include <stddef.h>
 #include <stdint.h>
@@ -25,6 +25,8 @@ typedef struct {
     size_t history_draft_length;
     volatile uint8_t command_pending;
     volatile uint8_t command_active;
+    volatile uint8_t prompt_pending;
+    uint8_t prompt_initialized;
 } virtual_tty_t;
 
 
@@ -32,9 +34,12 @@ void terminal_initialize(void);
 void terminal_putchar(char c);
 void terminal_write(const char* data, size_t size);
 void terminal_writestring(const char* data);
+void terminal_clear(void);
 void terminal_setcolor(uint8_t color);
 void terminal_update_cursor(void);
 void terminal_setcolor(uint8_t color);
+size_t terminal_columns(void);
+size_t terminal_rows(void);
 
 // Функции многооконности
 void tty_create_vterms(void);

@@ -1,0 +1,45 @@
+Naroch networking
+=================
+
+The kernel currently supports the QEMU Intel e1000 and e1000e devices. The
+normal qemu.sh command enables the e1000 NIC with QEMU user-mode networking,
+which provides NAT without exposing a host port by default.
+
+Configuration
+-------------
+
+The initial network configuration is static:
+
+  IPv4 address: 10.0.2.15/24
+  Gateway:      10.0.2.2
+
+DHCP, DNS, TCP, IPv4 fragmentation, and general-purpose sockets are not
+implemented. IPv4 support is currently for UDP datagrams only.
+
+Shell commands
+--------------
+
+  lspci
+    Lists PCI device addresses, IDs, BAR assignments, and capability IDs.
+
+  netinfo
+    Shows the NIC MAC address, static IPv4 configuration, receive count, and
+    basic ARP/UDP queue statistics.
+
+  udp <IPv4-address> <port> <message>
+    Resolves the local destination or gateway with ARP and sends one UDP
+    datagram. Messages are limited to 256 bytes. For example:
+
+      udp 10.0.2.2 9000 "hello from Naroch"
+
+  udp-recv
+    Displays queued UDP datagrams addressed to the guest. The bounded receive
+    queue holds four packets; oversized or excess datagrams are dropped.
+
+To forward host UDP port 39101 to guest port 39100, add this option to the
+QEMU user-network backend:
+
+  -netdev user,id=net0,hostfwd=udp:127.0.0.1:39101-:39100
+
+Binding the forwarded port to 127.0.0.1 keeps it local to the host. Send a UDP
+datagram to host port 39101, then run `udp-recv` in Naroch.

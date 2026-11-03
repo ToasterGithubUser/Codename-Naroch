@@ -1,0 +1,50 @@
+Naroch hardware drivers
+=======================
+
+PC speaker
+----------
+
+The PC speaker uses PIT channel 2. Play a tone from the shell with:
+
+  beep 880 250
+
+The first value is frequency in hertz (20-20000); the second is duration in
+milliseconds (1-5000). Tone playback occupies the shell while it is active.
+
+PS/2 mouse
+----------
+
+The kernel initializes the auxiliary PS/2 port and polls three-byte mouse
+packets from the idle task. Run:
+
+  mouse
+
+The output contains the pointer's pixel coordinates, left/right/middle button
+state, and decoded packet count. Coordinates are clamped to a 640x400 text
+display area. This driver reports input state; the terminal does not yet draw
+a graphical pointer or dispatch click events to applications.
+
+QEMU's standard PC and Q35 machines provide the PS/2 controller. The mouse
+driver is polled and does not require enabling IRQ12.
+
+Display modes
+-------------
+
+The GRUB menu offers GRUB's default mode and several common resolutions. The
+kernel reports its active framebuffer size and color depth with:
+
+  display
+
+To see all modes advertised by the monitor/firmware, press `c` at the GRUB
+menu and run `videoinfo`; it also reports the EDID preferred mode. Select a
+resolution in the menu to use it until the next reboot.
+
+FAT16 formatting
+----------------
+
+Run `format` to see the warning, then type `format yes` to confirm. This
+formats the currently mounted FAT16 volume, or creates a FAT16 primary
+partition on the primary disk if no FAT16 volume is mounted. Creating a new
+partition replaces the existing partition table. Formatting clears filesystem
+metadata but does not securely erase old file contents; back up anything
+important first.

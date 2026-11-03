@@ -7,6 +7,7 @@
 
 void vfs_init(void);
 int vfs_is_mounted(void);
+int vfs_format_fat16(void);
 int vfs_resolve_path(const char* path, char* resolved, size_t capacity);
 const char* vfs_getcwd(void);
 void vfs_list(void);

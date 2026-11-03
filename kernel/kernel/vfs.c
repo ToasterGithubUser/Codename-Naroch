@@ -61,6 +61,14 @@ int vfs_is_mounted(void) {
     return root_backend != 0;
 }
 
+int vfs_format_fat16(void) {
+    if (open_paths || !fat16_format()) {
+        return 0;
+    }
+    root_backend = &fat16_backend;
+    return 1;
+}
+
 int vfs_resolve_path(const char* path, char* resolved, size_t capacity) {
     if (!root_backend || !path || !*path || !resolved || capacity < 2 ||
         capacity > VFS_PATH_MAX + 1) {

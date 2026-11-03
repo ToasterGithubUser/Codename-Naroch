@@ -13,6 +13,11 @@
 #include <kernel/syscall.h>
 #include <kernel/serial.h>
 #include <kernel/rtc.h>
+#include <kernel/pci.h>
+#include <kernel/net.h>
+#include <kernel/pc_speaker.h>
+#include <kernel/ps2_mouse.h>
+#include <kernel/video.h>
 #include <kernel/ata.h>
 #include <kernel/vfs.h>
 #include <string.h>
@@ -33,6 +38,189 @@ int strcmp(const char *s1, const char *s2) {
         s2++;
     }
     return *(const unsigned char *)s1 - *(const unsigned char *)s2;
+}
+
+static const char* const shell_command_names[] = {
+    "beep", "cat", "cd", "clear", "date", "devices", "exec", "format",
+    "help", "crash", "display", "ktest", "lspci", "ls", "malloc", "mkdir", "mouse",
+    "netinfo", "pagefault", "ring3check", "rm", "rmdir", "shellstat",
+    "sleep", "touch", "udp", "udp-recv", "version", "write"
+};
+
+static void shell_complete_command(virtual_tty_t* tty) {
+    size_t prefix_length = tty->shell_idx;
+    for (size_t i = 0; i < prefix_length; i++) {
+        if (tty->shell_buf[i] == ' ' || tty->shell_buf[i] == '\t') {
+            return;
+        }
+    }
+
+    for (size_t i = 0; i < sizeof(shell_command_names) /
+                                sizeof(shell_command_names[0]); i++) {
+        if (strcmp(shell_command_names[i], tty->shell_buf) == 0) {
+            shell_input_char(' ');
+            return;
+        }
+    }
+
+    const char* match = 0;
+    size_t match_count = 0;
+    for (size_t i = 0; i < sizeof(shell_command_names) /
+                                sizeof(shell_command_names[0]); i++) {
+        const char* candidate = shell_command_names[i];
+        if (strncmp(candidate, tty->shell_buf, prefix_length) == 0) {
+            match = candidate;
+            match_count++;
+        }
+    }
+    if (!match_count) {
+        return;
+    }
+
+    if (match_count == 1) {
+        size_t length = strlen(match);
+        while (tty->shell_idx < length) {
+            shell_input_char(match[tty->shell_idx]);
+        }
+        shell_input_char(' ');
+        return;
+    }
+
+    terminal_putchar('\n');
+    for (size_t i = 0; i < sizeof(shell_command_names) /
+                                sizeof(shell_command_names[0]); i++) {
+        const char* candidate = shell_command_names[i];
+        if (strncmp(candidate, tty->shell_buf, prefix_length) == 0) {
+            printf("%s  ", candidate);
+        }
+    }
+    terminal_putchar('\n');
+    shell_prompt();
+    terminal_write(tty->shell_buf, tty->shell_idx);
+}
+
+static void shell_print_hex(uint32_t value, uint32_t digits) {
+    static const char hex[] = "0123456789abcdef";
+    for (uint32_t shift = digits * 4; shift; shift -= 4) {
+        putchar(hex[(value >> (shift - 4)) & 0xF]);
+    }
+}
+
+static void shell_print_ipv4(uint32_t address) {
+    printf("%u.%u.%u.%u", (address >> 24) & 0xFF,
+           (address >> 16) & 0xFF, (address >> 8) & 0xFF, address & 0xFF);
+}
+
+static int shell_parse_port(const char* text, uint16_t* port) {
+    if (!text || !*text || !port) {
+        return 0;
+    }
+    uint32_t value = 0;
+    while (*text >= '0' && *text <= '9') {
+        uint32_t digit = (uint32_t)(*text++ - '0');
+        if (value > (65535U - digit) / 10) {
+            return 0;
+        }
+        value = value * 10 + digit;
+    }
+    if (*text || !value) {
+        return 0;
+    }
+    *port = (uint16_t)value;
+    return 1;
+}
+
+static int shell_parse_u32(const char* text, uint32_t* value) {
+    if (!text || !*text || !value) {
+        return 0;
+    }
+    uint32_t result = 0;
+    while (*text >= '0' && *text <= '9') {
+        uint32_t digit = (uint32_t)(*text++ - '0');
+        if (result > (UINT32_MAX - digit) / 10) {
+            return 0;
+        }
+        result = result * 10 + digit;
+    }
+    if (*text) {
+        return 0;
+    }
+    *value = result;
+    return 1;
+}
+
+static void shell_print_pci_details(const pci_device_t* device) {
+    uint8_t header_type = device->header_type & 0x7F;
+    uint32_t bar_count = header_type == 0 ? 6 : header_type == 1 ? 2 : 1;
+    for (uint32_t i = 0; i < bar_count; i++) {
+        uint8_t offset = (uint8_t)(0x10 + i * 4);
+        uint32_t bar = pci_read_config32(device->bus, device->device,
+                                         device->function, offset);
+        if (!bar || bar == 0xFFFFFFFF) {
+            continue;
+        }
+
+        printf("  BAR%u ", i);
+        if (bar & 1) {
+            printf("I/O 0x");
+            shell_print_hex(bar & 0xFFFFFFFC, 8);
+        } else {
+            uint32_t type = (bar >> 1) & 3;
+            if (type == 2 && i + 1 < bar_count) {
+                uint32_t high = pci_read_config32(
+                    device->bus, device->device, device->function,
+                    (uint8_t)(offset + 4));
+                printf("MMIO64 0x");
+                shell_print_hex(high, 8);
+                shell_print_hex(bar & 0xFFFFFFF0, 8);
+                i++;
+            } else if (type == 0 || type == 1) {
+                printf("MMIO32 0x");
+                shell_print_hex(bar & (type == 1 ? 0x000FFFF0 : 0xFFFFFFF0),
+                                8);
+            } else {
+                printf("reserved (0x");
+                shell_print_hex(bar, 8);
+                putchar(')');
+            }
+        }
+        putchar('\n');
+    }
+
+    uint32_t status_command = pci_read_config32(
+        device->bus, device->device, device->function, 0x04);
+    if (!((status_command >> 20) & 1)) {
+        printf("  Capabilities: none\n");
+        return;
+    }
+
+    uint8_t pointer_offset = header_type == 2 ? 0x14 : 0x34;
+    uint8_t pointer = (uint8_t)pci_read_config32(
+        device->bus, device->device, device->function, pointer_offset);
+    uint8_t visited[64] = {0};
+    uint32_t count = 0;
+    while (pointer >= 0x40 && pointer <= 0xFC && count++ < 48) {
+        pointer &= 0xFC;
+        uint32_t slot = pointer >> 2;
+        if (visited[slot]) {
+            printf("  Capabilities: malformed list (cycle)\n");
+            return;
+        }
+        visited[slot] = 1;
+        uint32_t capability = pci_read_config32(
+            device->bus, device->device, device->function, pointer);
+        printf("  Capability 0x");
+        shell_print_hex(capability & 0xFF, 2);
+        printf(" at 0x");
+        shell_print_hex(pointer, 2);
+        putchar('\n');
+        pointer = (uint8_t)(capability >> 8);
+    }
+    if (pointer && (pointer < 0x40 || pointer > 0xFC)) {
+        printf("  Capabilities: malformed pointer\n");
+    } else if (count >= 48 && pointer) {
+        printf("  Capabilities: list limit reached\n");
+    }
 }
 
 static char* parse_filename_argument(char* argument) {
@@ -273,9 +461,19 @@ void shell_history_down(void) {
 }
 
 void shell_prompt(void) {
-    terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
+    uint32_t flags;
+    asm volatile("pushfl; popl %0; cli" : "=r"(flags) : : "memory");
+    virtual_tty_t* tty = tty_get_current();
+    terminal_setcolor(vga_entry_color(VGA_COLOR_GREEN, VGA_COLOR_BLACK));
     printf("naroch:%s> ", vfs_getcwd());
     terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK));
+    if (tty) {
+        tty->prompt_initialized = 1;
+        tty->prompt_pending = 0;
+    }
+    if (flags & 0x200) {
+        asm volatile("sti" : : : "memory");
+    }
 }
 
 void shell_input_char(char c) {
@@ -284,8 +482,16 @@ void shell_input_char(char c) {
         return;
     }
 
-    if (c == '\n') {
+    if (c == '\t') {
+        shell_complete_command(tty);
+    }
+    else if (c == '\n') {
         terminal_putchar('\n');
+        while (tty->shell_idx &&
+               (tty->shell_buf[tty->shell_idx - 1] == ' ' ||
+                tty->shell_buf[tty->shell_idx - 1] == '\t')) {
+            tty->shell_idx--;
+        }
         tty->shell_buf[tty->shell_idx] = '\0'; // Финализируем строку в TTY
         shell_remember_command(tty);
         shell_clear_history_navigation(tty);
@@ -312,7 +518,14 @@ void shell_input_char(char c) {
 
 void shell_process_pending(void) {
     virtual_tty_t* tty = tty_get_current();
-    if (!tty || !tty->command_pending || tty->command_active) {
+    if (!tty) {
+        return;
+    }
+    if (tty->prompt_pending && !tty->prompt_initialized) {
+        shell_prompt();
+        return;
+    }
+    if (!tty->command_pending || tty->command_active) {
         return;
     }
 
@@ -352,14 +565,35 @@ void shell_execute(void) {
         printf("  cat <file> - Display a FAT16 file (quote names with spaces)\n");
         printf("  touch <file> - Create an empty file (long names supported)\n");
         printf("  write <file> <data> - Create or replace a file (quote spaces)\n");
+        printf("  format              - Create a FAT16 filesystem on the primary disk\n");
+        printf("  format yes          - Confirm formatting (destroys filesystem metadata)\n");
         printf("  exec <file> [args] - Run a static ELF32 i386 executable\n");
         printf("  ./app.elf [args] - Run an ELF directly with arguments\n");
         printf("  ELF programs also support malloc/free and basic file I/O\n");
         printf("  ring3check - Test user-mode access to kernel memory\n");
         printf("  ring3check reports the boot-time user-mode protection test\n");
         printf("  date    - Read the CMOS real-time clock\n");
-        printf("  devices - Show detected serial and storage devices\n");
-    } 
+        printf("  display - Show the active framebuffer mode\n");
+        printf("  devices - Show detected devices\n");
+        printf("  lspci   - List enumerated PCI devices\n");
+        printf("  netinfo - Show network device and static IPv4 settings\n");
+        printf("  udp <ip> <port> <message> - Send a UDP datagram\n");
+        printf("  udp-recv - Show queued UDP datagrams\n");
+        printf("  mouse   - Show PS/2 mouse position and buttons\n");
+        printf("  beep <Hz> <ms> - Play a PC speaker tone\n");
+    }
+    else if (strcmp(cmd, "format") == 0) {
+        printf("Formatting destroys the current filesystem and may replace the partition table.\n");
+        printf("This is a quick format; it does not securely erase old file contents.\n");
+        printf("Type 'format yes' to confirm.\n");
+    }
+    else if (strcmp(cmd, "format yes") == 0) {
+        if (vfs_format_fat16()) {
+            printf("FAT16 format completed and mounted.\n");
+        } else {
+            printf("FAT16 format failed; close open files and check disk status.\n");
+        }
+    }
     else if (strcmp(cmd, "shellstat") == 0) {
         char diag_buf[32];
         printf("Active TTY Shell Buffer Stats:\n");
@@ -367,12 +601,7 @@ void shell_execute(void) {
         inttostr(tty->shell_capacity, diag_buf); printf("  Current capacity: "); printf(diag_buf); printf(" bytes\n");
     }
     else if (strcmp(cmd, "clear") == 0) {
-        tty->column = 0; tty->row = 0;
-        for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
-            tty->buffer[i] = ' ' | (tty->color << 8);
-            ((uint16_t*)0xB8000)[i] = tty->buffer[i];
-        }
-        terminal_update_cursor();
+        terminal_clear();
     } 
     else if (strcmp(cmd, "version") == 0) {
         char buf[16];
@@ -382,6 +611,18 @@ void shell_execute(void) {
         printf("]\n");
         printf("Architecture: i386 Protected Mode (Ring 0)\n");
         printf("Compiled on: "); printf(__DATE__); printf(" "); printf(__TIME__); printf("\n");
+    }
+    else if (strcmp(cmd, "display") == 0) {
+        if (video_is_framebuffer()) {
+            printf("Framebuffer: %u x %u, %u bpp\n",
+                   video_width(), video_height(), video_bpp());
+            printf("Console: %u x %u cells\n",
+                   (uint32_t)terminal_columns(), (uint32_t)terminal_rows());
+        } else {
+            printf("Framebuffer unavailable; using VGA text mode (80 x 25).\n");
+        }
+        printf("Select a boot mode in GRUB; run videoinfo there to list "
+               "monitor-supported modes.\n");
     }
     else if (strcmp(cmd, "date") == 0) {
         rtc_time_t time;
@@ -399,6 +640,136 @@ void shell_execute(void) {
         printf("Storage: %s\n", ata_backend_name());
         printf("CMOS RTC: %s\n",
                rtc_read_time(&time) ? "available" : "not detected");
+        if (pci_device_list_truncated()) {
+            printf("PCI: at least %u device(s) detected (list truncated)\n",
+                   pci_device_count());
+        } else {
+            printf("PCI: %u device(s) detected\n", pci_device_count());
+        }
+        printf("Network: %s\n", net_driver_name());
+        printf("PS/2 mouse: %s\n",
+               ps2_mouse_is_available() ? "available" : "not detected");
+    }
+    else if (strcmp(cmd, "netinfo") == 0) {
+        const uint8_t* mac = net_mac_address();
+        if (!mac) {
+            printf("No supported network device detected.\n");
+        } else {
+            printf("Network: %s\nMAC: ", net_driver_name());
+            for (uint32_t i = 0; i < 6; i++) {
+                if (i) {
+                    putchar(':');
+                }
+                shell_print_hex(mac[i], 2);
+            }
+            printf("\nIPv4: ");
+            shell_print_ipv4(net_ipv4_address());
+            printf("/24, gateway 10.0.2.2 (QEMU user networking)\n");
+            printf("RX frames: %u, ARP entries: %u\n",
+                   net_received_frame_count(), net_arp_cache_count());
+            printf("UDP packets dropped: %u\n", net_udp_dropped_count());
+        }
+    }
+    else if (strncmp(cmd, "udp-recv", 8) == 0 &&
+             (cmd[8] == '\0' || cmd[8] == ' ')) {
+        net_udp_packet_t packet;
+        uint32_t received = 0;
+        while (net_udp_receive(&packet)) {
+            printf("UDP from ");
+            shell_print_ipv4(packet.source_ip);
+            printf(":%u, %u bytes: ", packet.source_port, packet.length);
+            for (uint32_t i = 0; i < packet.length; i++) {
+                uint8_t character = packet.payload[i];
+                putchar(character >= 32 && character <= 126
+                    ? (char)character : '.');
+            }
+            putchar('\n');
+            received++;
+        }
+        if (!received) {
+            printf("No UDP datagrams queued.\n");
+        }
+    }
+    else if (strncmp(cmd, "udp ", 4) == 0) {
+        char* arguments[5];
+        int argc = shell_parse_arguments(cmd, arguments, 5);
+        uint32_t destination_ip;
+        uint16_t destination_port;
+        if (argc != 4 ||
+            !net_parse_ipv4(arguments[1], &destination_ip) ||
+            !shell_parse_port(arguments[2], &destination_port)) {
+            printf("Usage: udp <IPv4-address> <port> <message>\n");
+        } else {
+            size_t length = strlen(arguments[3]);
+            if (length > NET_UDP_MAX_PAYLOAD) {
+                printf("UDP message is limited to %u bytes.\n",
+                       NET_UDP_MAX_PAYLOAD);
+            } else if (net_udp_send(destination_ip, destination_port,
+                                    arguments[3], (uint16_t)length)) {
+                printf("UDP datagram sent (%u bytes).\n", (uint32_t)length);
+            } else {
+                printf("UDP send failed (network, ARP, or transmit error).\n");
+            }
+        }
+    }
+    else if (strcmp(cmd, "mouse") == 0) {
+        if (!ps2_mouse_is_available()) {
+            printf("PS/2 mouse not detected.\n");
+        } else {
+            ps2_mouse_state_t state;
+            ps2_mouse_get_state(&state);
+            printf("PS/2 mouse at %u,%u; buttons:", state.x, state.y);
+            printf(" left=%u right=%u middle=%u; packets=%u\n",
+                   state.buttons & 1, (state.buttons >> 1) & 1,
+                   (state.buttons >> 2) & 1, state.packets);
+        }
+    }
+    else if (strncmp(cmd, "beep ", 5) == 0) {
+        char* arguments[4];
+        uint32_t frequency;
+        uint32_t duration;
+        int argc = shell_parse_arguments(cmd, arguments, 4);
+        if (argc != 3 ||
+            !shell_parse_u32(arguments[1], &frequency) ||
+            !shell_parse_u32(arguments[2], &duration) ||
+            frequency < 20 || frequency > 20000 ||
+            duration < 1 || duration > 5000) {
+            printf("Usage: beep <frequency 20-20000 Hz> <duration 1-5000 ms>\n");
+        } else {
+            pc_speaker_beep(frequency, duration);
+            printf("Played %u Hz for %u ms.\n", frequency, duration);
+        }
+    }
+    else if (strcmp(cmd, "lspci") == 0) {
+        uint32_t count = pci_device_count();
+        if (!count) {
+            printf("No PCI devices detected.\n");
+        }
+        for (uint32_t i = 0; i < count; i++) {
+            const pci_device_t* device = pci_device_at(i);
+            if (!device) {
+                continue;
+            }
+            shell_print_hex(device->bus, 2);
+            putchar(':');
+            shell_print_hex(device->device, 2);
+            printf(".%u ", device->function);
+            shell_print_hex(device->vendor_id, 4);
+            putchar(':');
+            shell_print_hex(device->device_id, 4);
+            printf(" class ");
+            shell_print_hex(device->class_code, 2);
+            putchar(':');
+            shell_print_hex(device->subclass, 2);
+            putchar(':');
+            shell_print_hex(device->prog_if, 2);
+            putchar('\n');
+            shell_print_pci_details(device);
+        }
+        if (pci_device_list_truncated()) {
+            printf("PCI device list truncated at %u entries.\n",
+                   PCI_MAX_DEVICES);
+        }
     }
     else if (strcmp(cmd, "crash") == 0) {
         volatile int num = 5;
